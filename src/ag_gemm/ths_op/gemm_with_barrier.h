@@ -52,7 +52,8 @@ class GemmWithBarirer {
       torch::Tensor barrier,
       bool fast_accum,
       int32_t *producer_signal,
-      bool transpose_weight);
+      bool transpose_weight,
+      int chunks_per_rank = 1);
 
   torch::Tensor forward(
       torch::Tensor input,
@@ -68,7 +69,8 @@ class GemmWithBarirer {
       c10::optional<UnifiedGemmHParams> const &hparams,
       int32_t *producer_signal,  // this signal only be set in the producer kernel(communication
                                  // kernel for input, e.g. AllGather).
-      cudaStream_t stream);
+      cudaStream_t stream,
+      int chunks_per_rank = 1);
 
   torch::Tensor initialize(
       torch::Tensor input,
@@ -82,7 +84,8 @@ class GemmWithBarirer {
       bool fast_accum,
       bool transpose_weight,
       c10::optional<UnifiedGemmHParams> const &hparams,
-      cudaStream_t stream);
+      cudaStream_t stream,
+      int chunks_per_rank = 1);
 
   void run(cudaStream_t stream, bool launch_with_pdl);
 };

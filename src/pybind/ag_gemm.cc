@@ -17,12 +17,14 @@
 
 #include "ag_gemm/ths_op/all_gather_gemm_op.h"
 #include "ag_gemm/ths_op/all_gather_gemm_op_internode.h"
+#include "ag_gemm/ths_op/gin_all_gather_gemm_op.h"
 #include "flux/ths_op/flux_shm.h"
 #include "flux/ths_op/ths_pybind.h"
 namespace bytedance::flux::ths_op {
 
 using AllGatherGemmOpCls = TorchClassWrapper<AllGatherGemmOp>;
 using AllGatherGemmOpInterNodeCls = TorchClassWrapper<AllGatherGemmOpInterNode>;
+using GinAllGatherGemmOpCls = TorchClassWrapper<GinAllGatherGemmOp>;
 
 namespace py = pybind11;
 
@@ -101,6 +103,56 @@ static int _ [[maybe_unused]] = []() {
             py::arg("all_gather_option") = AllGatherOptionWithOptional(),
             py::arg("gathered_input") = py::none(),
             py::arg("prof_ctx") = nullptr);
+
+
+#ifdef FLUX_ENABLE_GIN_AG
+    py::class_<GinAllGatherGemmOpCls>(m, "GinAGKernel")
+        .def(
+            py::init([](c10::intrusive_ptr<c10d::ProcessGroup> tp_group,
+                        int32_t nnodes,
+                        int32_t full_m,
+                        int32_t n_dim,
+                        int32_t k_dim,
+                        py::object py_input_dtype,
+                        py::object py_output_dtype,
+                        int32_t chunks_per_rank,
+                        int32_t gin_contexts) {
+              auto input_dtype = torch::python::detail::py_object_to_dtype(py_input_dtype);
+              auto output_dtype = py_output_dtype.is(py::none())
+                                      ? input_dtype
+                                      : torch::python::detail::py_object_to_dtype(py_output_dtype);
+              return new GinAllGatherGemmOpCls(
+                  std::make_shared<C10dProcessGroup>("", tp_group),
+                  nnodes,
+                  full_m,
+                  n_dim,
+                  k_dim,
+                  input_dtype,
+                  output_dtype,
+                  chunks_per_rank,
+                  gin_contexts);
+            }),
+            py::arg("tp_group"),
+            py::arg("nnodes"),
+            py::arg("full_m"),
+            py::arg("n_dim"),
+            py::arg("k_dim"),
+            py::arg("input_dtype"),
+            py::arg("output_dtype") = py::none(),
+            py::arg("chunks_per_rank") = 0,
+            py::arg("gin_contexts") = 4)
+        .def(
+            "forward",
+            &GinAllGatherGemmOpCls::forward,
+            py::arg("input"),
+            py::arg("weight"),
+            py::arg("bias") = py::none(),
+            py::arg("output") = py::none(),
+            py::arg("fast_accum") = false,
+            py::arg("transpose_weight") = false)
+        .def("gathered_input", &GinAllGatherGemmOpCls::gathered_input)
+        .def("chunks_per_rank", &GinAllGatherGemmOpCls::chunks_per_rank);
+#endif
 
     py::class_<AllGatherGemmOpInterNodeCls>(m, "AGKernelInterNode")
         .def(

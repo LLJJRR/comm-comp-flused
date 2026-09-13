@@ -24,6 +24,62 @@ set(FLUX_DEBUG
     CACHE INTERNAL "Define FLUX_DEBUG")
 option(WITH_PROTOBUF "build with protobuf" OFF)
 option(WITH_TRITON_AOT "build with triton Ahead-of-Time" OFF)
+set(NCCL_ROOT
+    "${PROJECT_SOURCE_DIR}/3rdparty/nccl/build/local"
+    CACHE PATH "NCCL installation root")
+option(ENABLE_GIN_AG "build NCCL GIN Rail-Ring AG+GEMM fusion" OFF)
+set(NCCL_DEVICE_INCLUDE_DIR "$ENV{NCCL_DEVICE_INCLUDE_DIR}" CACHE PATH
+    "NCCL 2.30.x source/internal include directory containing nccl_device.h")
+set(NCCL_PUBLIC_INCLUDE_DIR "$ENV{NCCL_PUBLIC_INCLUDE_DIR}" CACHE PATH
+    "NCCL installed include directory containing nccl.h")
+if(ENABLE_GIN_AG)
+  if(NOT NCCL_DEVICE_INCLUDE_DIR AND DEFINED ENV{NCCL_ROOT})
+    if(EXISTS "$ENV{NCCL_ROOT}/src/include/nccl_device.h")
+      set(NCCL_DEVICE_INCLUDE_DIR "$ENV{NCCL_ROOT}/src/include")
+    elseif(EXISTS "$ENV{NCCL_ROOT}/include/nccl/detail/include/nccl_device.h")
+      set(NCCL_DEVICE_INCLUDE_DIR "$ENV{NCCL_ROOT}/include/nccl/detail/include")
+    endif()
+  endif()
+  if(NOT EXISTS "${NCCL_DEVICE_INCLUDE_DIR}/nccl_device.h")
+    message(FATAL_ERROR
+      "ENABLE_GIN_AG requires NCCL 2.30.x Device API headers. Set "
+      "NCCL_DEVICE_INCLUDE_DIR to the directory containing nccl_device.h "
+      "(for a source tree: <nccl>/src/include).")
+  endif()
+  if(NOT NCCL_PUBLIC_INCLUDE_DIR)
+    get_filename_component(_NCCL_SRC_ROOT "${NCCL_DEVICE_INCLUDE_DIR}/../.." ABSOLUTE)
+    if(EXISTS "${_NCCL_SRC_ROOT}/build/local/include/nccl.h")
+      set(NCCL_PUBLIC_INCLUDE_DIR "${_NCCL_SRC_ROOT}/build/local/include")
+    endif()
+  endif()
+  if(NOT EXISTS "${NCCL_PUBLIC_INCLUDE_DIR}/nccl.h")
+    message(FATAL_ERROR
+      "ENABLE_GIN_AG requires the matching NCCL public headers. Set "
+      "NCCL_PUBLIC_INCLUDE_DIR to the directory containing nccl.h.")
+  endif()
+  # A source-tree nccl_device.h may enable the GDAKI backend on Hopper and
+  # include DOCA GPUNetIO headers that live outside src/include. Installed NCCL
+  # headers are self-contained; add the source auxiliary path only when present.
+  get_filename_component(_NCCL_SRC_ROOT "${NCCL_DEVICE_INCLUDE_DIR}/../.." ABSOLUTE)
+  set(NCCL_DEVICE_AUX_INCLUDE_DIR "")
+  if(EXISTS "${_NCCL_SRC_ROOT}/src/transport/net_ib/gdaki/doca-gpunetio/include")
+    set(NCCL_DEVICE_AUX_INCLUDE_DIR
+        "${_NCCL_SRC_ROOT}/src/transport/net_ib/gdaki/doca-gpunetio/include")
+  endif()
+  get_filename_component(_NCCL_INSTALL_PREFIX "${NCCL_PUBLIC_INCLUDE_DIR}" DIRECTORY)
+  find_library(NCCL_STATIC_LIBRARY
+    NAMES nccl_static
+    PATHS "${_NCCL_INSTALL_PREFIX}/lib"
+    NO_DEFAULT_PATH)
+  if(NOT NCCL_STATIC_LIBRARY)
+    message(FATAL_ERROR
+      "ENABLE_GIN_AG requires the matching libnccl_static.a under "
+      "${_NCCL_INSTALL_PREFIX}/lib. Build the selected NCCL tree first.")
+  endif()
+  add_definitions(-DFLUX_ENABLE_GIN_AG)
+  message(STATUS "GIN AG enabled; NCCL Device API headers: ${NCCL_DEVICE_INCLUDE_DIR}")
+  message(STATUS "GIN AG NCCL static library: ${NCCL_STATIC_LIBRARY}")
+endif()
 message("PYTHONPATH: ${PYTHONPATH}")
 message("NVShmem Support: ${ENABLE_NVSHMEM}")
 
@@ -241,6 +297,8 @@ string(REGEX REPLACE "compute_90" "compute_90a" CMAKE_CUDA_FLAGS
                      ${CMAKE_CUDA_FLAGS})
 
 set(COMMON_HEADER_DIRS
+    ${NCCL_ROOT}/include
+    ${NCCL_ROOT}/include/nccl/detail/include
     ${PROJECT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CMAKE_CURRENT_BINARY_DIR}
@@ -248,9 +306,15 @@ set(COMMON_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/library/include
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/profiler/include)
+if(ENABLE_GIN_AG)
+  list(APPEND COMMON_HEADER_DIRS
+       ${NCCL_DEVICE_INCLUDE_DIR} ${NCCL_PUBLIC_INCLUDE_DIR} ${NCCL_DEVICE_AUX_INCLUDE_DIR})
+endif()
 
 set(COMMON_LIB_DIRS "")
+list(APPEND COMMON_LIB_DIRS "${NCCL_ROOT}/lib")
 list(APPEND COMMON_LIB_DIRS "${CUDAToolkit_LIBRARY_DIR}")
+message(STATUS "NCCL root dir: ${NCCL_ROOT}")
 message(ENABLE_NVSHMEM "ENABLE_NVSHMEM is set to: ${ENABLE_NVSHMEM}")
 if(ENABLE_NVSHMEM)
   add_definitions(-DFLUX_SHM_USE_NVSHMEM)

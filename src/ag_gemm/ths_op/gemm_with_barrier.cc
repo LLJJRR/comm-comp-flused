@@ -106,7 +106,8 @@ GemmWithBarirer::forward(
     torch::Tensor barrier,
     bool fast_accum,
     int32_t *producer_signal,
-    bool transpose_weight) {
+    bool transpose_weight,
+    int chunks_per_rank) {
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   return forward(
       input,
@@ -121,7 +122,8 @@ GemmWithBarirer::forward(
       transpose_weight,
       c10::nullopt,  // use default hparams
       producer_signal,
-      stream);
+      stream,
+      chunks_per_rank);
 }
 
 torch::Tensor
@@ -138,7 +140,8 @@ GemmWithBarirer::forward(
     bool transpose_weight,
     c10::optional<UnifiedGemmHParams> const &hparams,
     int32_t *producer_signal,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int chunks_per_rank) {
   auto output_tensor = this->initialize(
       input,
       weight,
@@ -151,7 +154,8 @@ GemmWithBarirer::forward(
       fast_accum,
       transpose_weight,
       hparams,
-      stream);
+      stream,
+      chunks_per_rank);
 
   // if not a nullptr, gemm need to wait producer kernel to be launch.
   if (producer_signal != nullptr) {
@@ -177,7 +181,8 @@ GemmWithBarirer::initialize(
     bool fast_accum,
     bool transpose_weight,
     c10::optional<UnifiedGemmHParams> const &hparams,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int chunks_per_rank) {
   at::ScalarType input_dtype = input.scalar_type();
   bool is_fp8_gemm = ths_op::is_fp8_torch_dtype(input_dtype);
   bool is_s8_gemm = ths_op::is_s8_torch_dtype(input_dtype);
@@ -257,6 +262,7 @@ GemmWithBarirer::initialize(
         .rank = rank,
         .world_size = world_size,
         .nnodes = nnodes,
+        .chunks_per_rank = chunks_per_rank,
         .alpha = 1.0f,
         .beta = 0.0f,
         .A = input.data_ptr(),
@@ -294,6 +300,7 @@ GemmWithBarirer::initialize(
         .rank = rank,
         .world_size = world_size,
         .nnodes = nnodes,
+        .chunks_per_rank = chunks_per_rank,
         .alpha = 1.0f,
         .beta = bias.has_value() ? 1.0f : 0.0f,
         .A = input.data_ptr(),
@@ -312,6 +319,7 @@ GemmWithBarirer::initialize(
         .rank = rank,
         .world_size = world_size,
         .nnodes = nnodes,
+        .chunks_per_rank = chunks_per_rank,
         .alpha = 1.0f,
         .beta = bias.has_value() ? 1.0f : 0.0f,
         .input = input.data_ptr(),

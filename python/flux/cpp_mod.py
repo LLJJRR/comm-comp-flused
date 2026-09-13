@@ -155,6 +155,7 @@ if not isinstance(ReduceScatterOption, NotCompiled):
 
 # AG+GEMM
 AGKernel = _get_flux_member("AGKernel")
+GinAGKernel = _get_flux_member("GinAGKernel")
 AGKernelInterNode = _get_flux_member("AGKernelInterNode")
 
 # MOE ag-scatter
@@ -214,6 +215,7 @@ __all__ = [
     "GemmRS",
     "GemmRSInterNode",
     "AGKernel",
+    "GinAGKernel",
     "AGKernelInterNode",
     "AllToAllTransposeGemm",
     "All2AllOp",

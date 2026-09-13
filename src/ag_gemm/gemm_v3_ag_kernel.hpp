@@ -199,7 +199,8 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
                          /*scheduler=*/scheduler,
                          args.barrier_buffer,
                          args.rank,
-                         args.world_size};
+                         args.world_size,
+                         args.chunks_per_rank};
   }
 
   auto
@@ -263,7 +264,8 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
                          /*scheduler=*/scheduler,
                          args.barrier_buffer,
                          args.rank,
-                         args.world_size};
+                         args.world_size,
+                         args.chunks_per_rank};
   }
 
   auto

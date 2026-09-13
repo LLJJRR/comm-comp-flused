@@ -24,3 +24,7 @@ python/flux/version.py
 
 # due to using tox and pytest and clangd
 .tox
+
+# machine-local H100 runtime environment
+flux_env.sh
+/3rdparty/cutlass/docs/

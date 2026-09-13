@@ -26,6 +26,7 @@ struct AGKernelArguments {
   int rank;
   int world_size;
   int nnodes;
+  int chunks_per_rank = 1;
   float alpha;
   float beta;
   void *input;
@@ -42,6 +43,7 @@ struct AGS8KernelArguments {
   int rank;
   int world_size;
   int nnodes;
+  int chunks_per_rank = 1;
   float alpha;
   float beta;
   void *A;
@@ -60,6 +62,7 @@ struct AGFP8KernelArguments {
   int rank;
   int world_size;
   int nnodes;
+  int chunks_per_rank = 1;
   float alpha;
   float beta;
   void *A;        // all gathered A, aka input_buffer

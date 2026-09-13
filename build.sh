@@ -2,8 +2,10 @@
 set -x
 set -e
 
-## Change export PATH if cuda is not at default path
-export PATH=/usr/local/cuda/bin:$PATH
+## Keep the CUDA toolkit selected by the caller. This is important on hosts
+## with multiple CUDA installations because PyTorch and nvcc must match.
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+export PATH=${CUDA_HOME}/bin:$PATH
 CMAKE=${CMAKE:-cmake}
 
 ARCH=""
@@ -13,6 +15,7 @@ BDIST_WHEEL="OFF"
 WITH_PROTOBUF="OFF"
 FLUX_DEBUG="OFF"
 ENABLE_NVSHMEM="OFF"
+ENABLE_GIN_AG="OFF"
 WITH_TRITON_AOT="OFF"
 
 function clean_py() {
@@ -81,6 +84,10 @@ while [[ $# -gt 0 ]]; do
         ENABLE_NVSHMEM="ON"
         shift
         ;;
+    --gin-ag)
+        ENABLE_GIN_AG="ON"
+        shift
+        ;;
     --triton-aot)
         WITH_TRITON_AOT="ON"
         shift
@@ -96,6 +103,12 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT=${SCRIPT_DIR}
 PROTOBUF_ROOT=$PROJECT_ROOT/3rdparty/protobuf
+# GIN AG must compile and link against the exact NCCL source tree that carries
+# the Device API/GIN implementation being tested.  Keep source and install roots
+# separate so an external patched NCCL tree can be selected without copying it
+# into Flux's submodule directory.
+NCCL_SOURCE_ROOT=${NCCL_SOURCE_ROOT:-$PROJECT_ROOT/3rdparty/nccl}
+NCCL_INSTALL_ROOT=${NCCL_INSTALL_ROOT:-${NCCL_SOURCE_ROOT}/build/local}
 
 cd ${PROJECT_ROOT}
 
@@ -130,9 +143,9 @@ function build_protobuf() {
 }
 
 function build_nccl() {
-    pushd $NCCL_ROOT
-    export BUILDDIR=${NCCL_ROOT}/build
-    export PREFIX=${BUILDDIR}/local
+    pushd $NCCL_SOURCE_ROOT
+    export BUILDDIR=${NCCL_SOURCE_ROOT}/build
+    export PREFIX=${NCCL_INSTALL_ROOT}
 
     if [[ -n $ARCH ]]; then
         NCCL_COMPILE_OPTIONS_ARCH="" # default none
@@ -141,9 +154,9 @@ function build_nccl() {
         for arch in "${arch_list[@]}"; do
             NCCL_COMPILE_OPTIONS_ARCH="-gencode=arch=compute_${arch},code=sm_${arch} ${NCCL_COMPILE_OPTIONS_ARCH}"
         done
-        make -j${nproc} src.staticlib NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=1
+        make -j${JOBS} src.staticlib CUDARTLIB=cudart NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=1
     else
-        make -j${nproc} src.staticlib VERBOSE=1
+        make -j${JOBS} src.staticlib CUDARTLIB=cudart VERBOSE=1
     fi
     # only install static lib
     mkdir -p ${PREFIX}/lib
@@ -160,6 +173,10 @@ function build_flux_cuda() {
     if [ ! -f CMakeCache.txt ] || [ -z ${FLUX_BUILD_SKIP_CMAKE} ]; then
         CMAKE_ARGS=(
             -DENABLE_NVSHMEM=${ENABLE_NVSHMEM}
+            -DENABLE_GIN_AG=${ENABLE_GIN_AG}
+            -DNCCL_ROOT=${NCCL_INSTALL_ROOT}
+            -DNCCL_DEVICE_INCLUDE_DIR=${NCCL_SOURCE_ROOT}/src/include
+            -DNCCL_PUBLIC_INCLUDE_DIR=${NCCL_INSTALL_ROOT}/include
             -DNVSHMEM_HOME=${NVSHMEM_HOME}
             -DCUDAARCHS=${ARCH}
             -DGPU_SM_CORES=${SM_CORES}
@@ -194,9 +211,10 @@ function build_flux_cuda() {
 
 function merge_compile_commands() {
     cd $SCRIPT_DIR
-    if command -v ninja >/dev/null 2>&1; then
-        # generate compile_commands.json
-        ninja -f $(ls ./build/temp.*/build.ninja) -t compdb >build/compile_commands_ths_op.json
+    local ths_build_ninja
+    ths_build_ninja=$(find ./build -path './build/temp.*/build.ninja' -print -quit 2>/dev/null || true)
+    if [[ -n "${ths_build_ninja}" ]] && command -v ninja >/dev/null 2>&1; then
+        ninja -f "${ths_build_ninja}" -t compdb >build/compile_commands_ths_op.json
         cat >build/merge_compile_commands.py <<EOF
 import json
 with open("build/compile_commands.json") as f:
@@ -209,6 +227,8 @@ EOF
 
         python3 build/merge_compile_commands.py
         echo "merge compile_commands.json done"
+    elif [[ -z "${ths_build_ninja}" ]]; then
+        echo "skip merge_compile_commands: torch extension build.ninja not found"
     else
         echo "Ninja is not installed. Ninja is required for flux_ths_pybind's compile_commands.json. run 'pip3 install ninja'"
     fi
@@ -222,16 +242,27 @@ function build_flux_py {
     if [ $ENABLE_NVSHMEM == "ON" ]; then
         export FLUX_SHM_USE_NVSHMEM=1
     fi
+    export NCCL_ROOT=${NCCL_INSTALL_ROOT}
+    if [ $ENABLE_GIN_AG == "ON" ]; then
+        export FLUX_ENABLE_GIN_AG=1
+        export NCCL_DEVICE_INCLUDE_DIR=${NCCL_SOURCE_ROOT}/src/include
+        export NCCL_PUBLIC_INCLUDE_DIR=${NCCL_INSTALL_ROOT}/include
+    fi
     popd
     ##### build flux torch bindings #####
-    MAX_JOBS=${JOBS} python3 setup.py develop --user
+    # The H100 environment uses a venv. Avoid setup.py develop --user there:
+    # it can escape the venv and PEP517/build-isolation can pull mismatched deps.
+    PIP_INSTALL_ARGS=(install -e . --no-build-isolation)
+    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+        PIP_INSTALL_ARGS+=(--user)
+    fi
+    MAX_JOBS=${JOBS} python3 -m pip "${PIP_INSTALL_ARGS[@]}"
     if [ $BDIST_WHEEL == "ON" ]; then
         MAX_JOBS=${JOBS} python3 setup.py bdist_wheel
     fi
 }
 
-trap merge_compile_commands EXIT
-NCCL_ROOT=$PROJECT_ROOT/3rdparty/nccl
+trap 'rc=$?; if [ "$rc" -eq 0 ]; then merge_compile_commands || true; fi; exit "$rc"' EXIT
 build_nccl
 
 if [ $ENABLE_NVSHMEM == "ON" ]; then

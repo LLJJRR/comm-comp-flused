@@ -84,7 +84,6 @@ using Barrier = GenericBarrier<cutlass::detail::SyncthreadsSync>;
 using SystemBarrier = cutlass::detail::SystemBarrier;
 using WarpBarrier = GenericBarrier<cutlass::detail::SyncwarpSync>;
 
-#define SPLIT 1
 
 template <
     class ProblemShape_,
@@ -196,6 +195,7 @@ public:
     void *ptr_barrier = nullptr;
     int rank = 0;
     int world_size = 0;
+    int chunks_per_rank = 1;
   };
 
   // Kernel entry point API
@@ -209,6 +209,7 @@ public:
     void *ptr_barrier;
     int rank;
     int world_size;
+    int chunks_per_rank;
     int TILE_SIZE_M;
     int n_data_chunks;
     int m_per_data_chunk;
@@ -268,9 +269,11 @@ public:
     auto problem_blocks =
         TileScheduler::get_tiled_cta_shape_mnl(problem_shape_MNKL, TileShape{}, ClusterShape{});
     CUTLASS_ASSERT(args.world_size != 0);
+    CUTLASS_ASSERT(args.chunks_per_rank > 0);
 
     int TILE_SIZE_M = size<0>(TileShape{});
-    int n_data_chunks = args.world_size * SPLIT;
+    int n_data_chunks = args.world_size * args.chunks_per_rank;
+    CUTLASS_ASSERT(get<0>(problem_shape_MNKL) % n_data_chunks == 0);
     int m_per_data_chunk = get<0>(problem_shape_MNKL) / n_data_chunks;
 
     return {
@@ -285,6 +288,7 @@ public:
         args.ptr_barrier,
         args.rank,
         args.world_size,
+        args.chunks_per_rank,
         TILE_SIZE_M,
         n_data_chunks,
         m_per_data_chunk,

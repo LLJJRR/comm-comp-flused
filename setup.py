@@ -29,6 +29,7 @@ BASE_WHEEL_URL = "https://github.com/bytedance/flux/releases/download/{tag_name}
 FLUX_FORCE_BUILD = _get_bool_from_env("FLUX_FORCE_BUILD")
 USE_LOCAL_VERSION = _get_bool_from_env("FLUX_USE_LOCAL_VERSION")
 WITH_TRITON_AOT = _get_bool_from_env("FLUX_WITH_TRITON_AOT")
+ENABLE_GIN_AG = _get_bool_from_env("FLUX_ENABLE_GIN_AG")
 
 
 def cuda_version() -> Tuple[int, ...]:
@@ -164,6 +165,10 @@ def cuda_deps():
 def nccl_deps():
     nccl_home = Path(os.environ.get("NCCL_ROOT", root_path / "3rdparty/nccl/build/local"))
     include_dirs = [nccl_home / "include", nccl_home / "include" / "nccl" / "detail" / "include"]
+    if ENABLE_GIN_AG:
+        device_inc = Path(os.environ.get("NCCL_DEVICE_INCLUDE_DIR", root_path / "3rdparty/nccl/src/include"))
+        public_inc = Path(os.environ.get("NCCL_PUBLIC_INCLUDE_DIR", nccl_home / "include"))
+        include_dirs.extend([device_inc, public_inc])
     library_dirs = [nccl_home / "lib"]
     libraries = ["nccl_static"]
     return include_dirs, library_dirs, libraries
@@ -204,6 +209,8 @@ def setup_pytorch_extension() -> setuptools.Extension:
         cxx_flags.append("-DFLUX_SHM_USE_NVSHMEM")
     if WITH_TRITON_AOT:
         cxx_flags.append("-DFLUX_WITH_TRITON_AOT")
+    if ENABLE_GIN_AG:
+        cxx_flags.append("-DFLUX_ENABLE_GIN_AG")
     ld_flags = ["-Wl,--exclude-libs=libnccl_static"]
     flux_ths_targets = [
         str(x.relative_to(root_path))  # relative path for include_package_data

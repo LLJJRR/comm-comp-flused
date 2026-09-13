@@ -482,6 +482,31 @@ class AGKernel:
         prof_ctx: Optional[ProfilingContext] = None,
     ) -> torch.Tensor: ...
 
+class GinAGKernel:
+    def __init__(
+        self,
+        tp_group: dist.ProcessGroup,
+        nnodes: int,
+        full_m: int,
+        n_dim: int,
+        k_dim: int,
+        input_dtype: torch.dtype,
+        output_dtype: Optional[torch.dtype] = None,
+        chunks_per_rank: int = 0,
+        gin_contexts: int = 4,
+    ): ...
+    def forward(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+        fast_accum: bool = False,
+        transpose_weight: bool = False,
+    ) -> torch.Tensor: ...
+    def gathered_input(self) -> torch.Tensor: ...
+    def chunks_per_rank(self) -> int: ...
+
 class AGKernelInterNode:
     def __init__(
         self,
