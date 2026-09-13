@@ -360,13 +360,13 @@ ComputeScale(const float amax, const float eps) {
   return scale;
 }
 
-PFN_cuTensorMapEncodeTiled
+PFN_cuTensorMapEncodeTiled_v12000
 get_cuTensorMapEncodeTiled() {
   void *driver_ptr = nullptr;
   cudaDriverEntryPointQueryResult driver_status;
   cudaGetDriverEntryPoint(
       "cuTensorMapEncodeTiled", &driver_ptr, cudaEnableDefault, &driver_status);
-  return reinterpret_cast<PFN_cuTensorMapEncodeTiled>(driver_ptr);
+  return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(driver_ptr);
 }
 
 template <typename OutputType>

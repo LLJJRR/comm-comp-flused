@@ -23,7 +23,7 @@ if(ENABLE_GIN_AG)
   # exact patched static library instead of relying on whichever NCCL PyTorch
   # may already have loaded in the process.
   target_link_libraries(flux_cuda_ths_op
-    PRIVATE ${NCCL_STATIC_LIBRARY} pthread rt dl)
+    ${NCCL_STATIC_LIBRARY} pthread rt dl)
   target_link_options(flux_cuda_ths_op
     PRIVATE $<$<PLATFORM_ID:Linux>:LINKER:--exclude-libs=libnccl_static.a>)
 endif()

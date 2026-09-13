@@ -24,6 +24,11 @@ set(FLUX_DEBUG
     CACHE INTERNAL "Define FLUX_DEBUG")
 option(WITH_PROTOBUF "build with protobuf" OFF)
 option(WITH_TRITON_AOT "build with triton Ahead-of-Time" OFF)
+set(FLUX_BUILD_SCOPE "all" CACHE STRING
+    "Build scope: all, comm_none, ag_gemm, gemm_rs, gemm_a2a_transpose, a2a_transpose_gemm, moe_ag_scatter, moe_gather_rs")
+set_property(CACHE FLUX_BUILD_SCOPE PROPERTY STRINGS
+    all comm_none ag_gemm gemm_rs gemm_a2a_transpose a2a_transpose_gemm
+    moe_ag_scatter moe_gather_rs)
 set(NCCL_ROOT
     "${PROJECT_SOURCE_DIR}/3rdparty/nccl/build/local"
     CACHE PATH "NCCL installation root")
@@ -238,6 +243,18 @@ print(os.path.dirname(torch.__file__),end='');"
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
+
+  # CUDA 13 no longer provides the legacy nvToolsExt library target, while
+  # PyTorch 2.6 still references CUDA::nvToolsExt from its CMake package.
+  # CMake's FindCUDAToolkit exposes header-only CUDA::nvtx3, so provide a
+  # compatibility alias before importing Torch.
+  if(TARGET CUDA::nvtx3 AND NOT TARGET CUDA::nvToolsExt)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+    set_property(TARGET CUDA::nvToolsExt PROPERTY
+                 INTERFACE_LINK_LIBRARIES CUDA::nvtx3)
+    message(STATUS "CUDA compatibility: CUDA::nvToolsExt -> CUDA::nvtx3")
+  endif()
+
   find_package(Torch REQUIRED)
   find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_DIR}/lib")
 

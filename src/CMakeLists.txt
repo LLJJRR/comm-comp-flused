@@ -43,11 +43,38 @@ execute_process(
   COMMAND_ERROR_IS_FATAL ANY
 )
 
-execute_process(
-  COMMAND ${CMAKE_COMMAND} --build . --parallel 8
-  WORKING_DIRECTORY ${FLUX_GENERATOR_BINARY_DIR}
-  COMMAND_ERROR_IS_FATAL ANY
-)
+set(_FLUX_GENERATOR_TARGET "")
+if(FLUX_BUILD_SCOPE STREQUAL "comm_none")
+  set(_FLUX_GENERATOR_TARGET gen_comm_none)
+elseif(FLUX_BUILD_SCOPE STREQUAL "ag_gemm")
+  set(_FLUX_GENERATOR_TARGET gen_ag_gemm)
+elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_rs")
+  set(_FLUX_GENERATOR_TARGET gen_gemm_rs)
+elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_a2a_transpose")
+  set(_FLUX_GENERATOR_TARGET gen_gemm_a2a_transpose)
+elseif(FLUX_BUILD_SCOPE STREQUAL "a2a_transpose_gemm")
+  set(_FLUX_GENERATOR_TARGET gen_a2a_transpose_gemm)
+elseif(FLUX_BUILD_SCOPE STREQUAL "moe_ag_scatter")
+  set(_FLUX_GENERATOR_TARGET gen_moe_ag_scatter)
+elseif(FLUX_BUILD_SCOPE STREQUAL "moe_gather_rs")
+  set(_FLUX_GENERATOR_TARGET gen_moe_gather_rs)
+elseif(NOT FLUX_BUILD_SCOPE STREQUAL "all")
+  message(FATAL_ERROR "Unknown FLUX_BUILD_SCOPE='${FLUX_BUILD_SCOPE}'")
+endif()
+
+if(_FLUX_GENERATOR_TARGET)
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} --build . --parallel 8 --target ${_FLUX_GENERATOR_TARGET}
+    WORKING_DIRECTORY ${FLUX_GENERATOR_BINARY_DIR}
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+else()
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} --build . --parallel 8
+    WORKING_DIRECTORY ${FLUX_GENERATOR_BINARY_DIR}
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+endif()
 
 if (WITH_TRITON_AOT)
   execute_process(
@@ -66,31 +93,58 @@ if (WITH_TRITON_AOT)
   add_definitions(-DFLUX_WITH_TRITON_AOT)
 endif()
 
-add_subdirectory(comm_none)
-add_subdirectory(coll)
-add_subdirectory(ag_gemm)
-add_subdirectory(gemm_rs)
-add_subdirectory(gemm_a2a_transpose)
-add_subdirectory(a2a_transpose_gemm)
-add_subdirectory(inplace_cast)
+# A minimal scope intentionally configures/builds only one fusion family.  It is
+# for fast kernel iteration and therefore does not build the aggregate CUDA/THS
+# libraries.  The default "all" scope retains the original full build behavior.
+if(FLUX_BUILD_SCOPE STREQUAL "all")
+  add_subdirectory(comm_none)
+  add_subdirectory(coll)
+  add_subdirectory(ag_gemm)
+  add_subdirectory(gemm_rs)
+  add_subdirectory(gemm_a2a_transpose)
+  add_subdirectory(a2a_transpose_gemm)
+  add_subdirectory(inplace_cast)
 
-find_package(CUDAToolkit REQUIRED)
-if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.3")
-  add_subdirectory(quantization)
-endif()
+  find_package(CUDAToolkit REQUIRED)
+  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.3")
+    add_subdirectory(quantization)
+  endif()
 
-if(ENABLE_NVSHMEM)
-  # MoE OPs will not be open-sourced, so remain MoE OPs to be dependent on NVSHMEM
+  if(ENABLE_NVSHMEM)
+    add_subdirectory(moe_ag_scatter)
+    add_subdirectory(moe_gather_rs)
+  endif()
+elseif(FLUX_BUILD_SCOPE STREQUAL "comm_none")
+  add_subdirectory(comm_none)
+elseif(FLUX_BUILD_SCOPE STREQUAL "ag_gemm")
+  add_subdirectory(ag_gemm)
+elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_rs")
+  add_subdirectory(gemm_rs)
+elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_a2a_transpose")
+  add_subdirectory(gemm_a2a_transpose)
+elseif(FLUX_BUILD_SCOPE STREQUAL "a2a_transpose_gemm")
+  add_subdirectory(a2a_transpose_gemm)
+elseif(FLUX_BUILD_SCOPE STREQUAL "moe_ag_scatter")
+  if(NOT ENABLE_NVSHMEM)
+    message(FATAL_ERROR "moe_ag_scatter minimal build requires ENABLE_NVSHMEM=ON")
+  endif()
   add_subdirectory(moe_ag_scatter)
+elseif(FLUX_BUILD_SCOPE STREQUAL "moe_gather_rs")
+  if(NOT ENABLE_NVSHMEM)
+    message(FATAL_ERROR "moe_gather_rs minimal build requires ENABLE_NVSHMEM=ON")
+  endif()
   add_subdirectory(moe_gather_rs)
 endif()
+message(STATUS "FLUX_BUILD_SCOPE=${FLUX_BUILD_SCOPE}")
 message(STATUS "op_targets: ${FLUX_CUDA_OP_TARGETS}")
 
-# this must be after all op subdirectory added
-add_subdirectory(cuda)
+if(FLUX_BUILD_SCOPE STREQUAL "all")
+  # this must be after all op subdirectory added
+  add_subdirectory(cuda)
 
-if (BUILD_THS)
-  add_subdirectory(ths_op)
+  if (BUILD_THS)
+    add_subdirectory(ths_op)
+  endif()
 endif()
 
 include(GNUInstallDirs)

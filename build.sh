@@ -11,12 +11,15 @@ CMAKE=${CMAKE:-cmake}
 ARCH=""
 SM_CORES=""
 BUILD_TEST="ON"
+BUILD_THS="ON"
 BDIST_WHEEL="OFF"
 WITH_PROTOBUF="OFF"
 FLUX_DEBUG="OFF"
 ENABLE_NVSHMEM="OFF"
 ENABLE_GIN_AG="OFF"
 WITH_TRITON_AOT="OFF"
+BUILD_PROFILE="all"
+FORCE_FULL_BUILD="OFF"
 
 function clean_py() {
     rm -rf build/lib.*
@@ -86,6 +89,20 @@ while [[ $# -gt 0 ]]; do
         ;;
     --gin-ag)
         ENABLE_GIN_AG="ON"
+        # GIN AG development defaults to the minimal AG/GEMM object target.
+        # Use --full to retain the historical full Flux + Python build.
+        if [ "${BUILD_PROFILE}" = "all" ]; then
+            BUILD_PROFILE="gin-ag"
+        fi
+        shift
+        ;;
+    --target)
+        BUILD_PROFILE="$2"
+        shift
+        shift
+        ;;
+    --full)
+        FORCE_FULL_BUILD="ON"
         shift
         ;;
     --triton-aot)
@@ -99,6 +116,61 @@ while [[ $# -gt 0 ]]; do
         ;;
     esac
 done
+
+if [ "${FORCE_FULL_BUILD}" = "ON" ]; then
+    BUILD_PROFILE="all"
+fi
+
+# Map user-facing fusion profiles to the smallest CMake object-library target.
+# Minimal profiles are compile-check/development modes: they intentionally skip
+# aggregate install and Python bindings, which would pull every Flux op back in.
+BUILD_SCOPE="all"
+CMAKE_BUILD_TARGET=""
+case "${BUILD_PROFILE}" in
+    all)
+        ;;
+    gin-ag)
+        ENABLE_GIN_AG="ON"
+        BUILD_SCOPE="ag_gemm"
+        CMAKE_BUILD_TARGET="flux_cuda_all_gather"
+        ;;
+    ag-gemm)
+        BUILD_SCOPE="ag_gemm"
+        CMAKE_BUILD_TARGET="flux_cuda_all_gather"
+        ;;
+    gemm-rs)
+        BUILD_SCOPE="gemm_rs"
+        CMAKE_BUILD_TARGET="flux_cuda_reduce_scatter"
+        ;;
+    gemm-a2a-transpose)
+        BUILD_SCOPE="gemm_a2a_transpose"
+        CMAKE_BUILD_TARGET="flux_cuda_gemm_a2a_transpose"
+        ;;
+    a2a-transpose-gemm)
+        BUILD_SCOPE="a2a_transpose_gemm"
+        CMAKE_BUILD_TARGET="flux_cuda_all_to_all_gemm"
+        ;;
+    moe-ag-scatter)
+        ENABLE_NVSHMEM="ON"
+        BUILD_SCOPE="moe_ag_scatter"
+        CMAKE_BUILD_TARGET="flux_cuda_moe_ag_scatter"
+        ;;
+    moe-gather-rs)
+        ENABLE_NVSHMEM="ON"
+        BUILD_SCOPE="moe_gather_rs"
+        CMAKE_BUILD_TARGET="flux_cuda_moe_gather_rs"
+        ;;
+    *)
+        echo "Unknown --target profile: ${BUILD_PROFILE}" >&2
+        echo "Supported: all, gin-ag, ag-gemm, gemm-rs, gemm-a2a-transpose, a2a-transpose-gemm, moe-ag-scatter, moe-gather-rs" >&2
+        exit 2
+        ;;
+esac
+
+if [ "${BUILD_SCOPE}" != "all" ]; then
+    BUILD_THS="OFF"
+    BUILD_TEST="OFF"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT=${SCRIPT_DIR}
@@ -174,6 +246,7 @@ function build_flux_cuda() {
         CMAKE_ARGS=(
             -DENABLE_NVSHMEM=${ENABLE_NVSHMEM}
             -DENABLE_GIN_AG=${ENABLE_GIN_AG}
+            -DFLUX_BUILD_SCOPE=${BUILD_SCOPE}
             -DNCCL_ROOT=${NCCL_INSTALL_ROOT}
             -DNCCL_DEVICE_INCLUDE_DIR=${NCCL_SOURCE_ROOT}/src/include
             -DNCCL_PUBLIC_INCLUDE_DIR=${NCCL_INSTALL_ROOT}/include
@@ -181,6 +254,7 @@ function build_flux_cuda() {
             -DCUDAARCHS=${ARCH}
             -DGPU_SM_CORES=${SM_CORES}
             -DCMAKE_EXPORT_COMPILE_COMMANDS=1
+            -DBUILD_THS=${BUILD_THS}
             -DBUILD_TEST=${BUILD_TEST}
             -DCMAKE_INSTALL_PREFIX=${LIBFLUX_PREFIX}
         )
@@ -204,8 +278,13 @@ function build_flux_cuda() {
         fi
         ${CMAKE} .. ${CMAKE_ARGS[@]}
     fi
-    make -j${JOBS} VERBOSE=1
-    make install
+    if [ -n "${CMAKE_BUILD_TARGET}" ]; then
+        echo "Minimal Flux build: profile=${BUILD_PROFILE}, target=${CMAKE_BUILD_TARGET}"
+        make -j${JOBS} VERBOSE=1 "${CMAKE_BUILD_TARGET}"
+    else
+        make -j${JOBS} VERBOSE=1
+        make install
+    fi
     popd
 }
 
@@ -263,7 +342,11 @@ function build_flux_py {
 }
 
 trap 'rc=$?; if [ "$rc" -eq 0 ]; then merge_compile_commands || true; fi; exit "$rc"' EXIT
-build_nccl
+if [ "${ENABLE_GIN_AG}" = "ON" ] || [ "${BUILD_SCOPE}" = "all" ] || [ ! -f "${NCCL_INSTALL_ROOT}/include/nccl.h" ]; then
+    build_nccl
+else
+    echo "Skip NCCL rebuild for minimal profile ${BUILD_PROFILE}; using ${NCCL_INSTALL_ROOT}"
+fi
 
 if [ $ENABLE_NVSHMEM == "ON" ]; then
     if [ -n "$NVSHMEM_HOME" ]; then
@@ -285,4 +368,9 @@ fi
 
 build_protobuf
 build_flux_cuda
-build_flux_py
+if [ "${BUILD_SCOPE}" = "all" ]; then
+    build_flux_py
+else
+    echo "Minimal build complete: ${BUILD_PROFILE} -> ${CMAKE_BUILD_TARGET}"
+    echo "Run with --full when you need install/Python bindings/full regression."
+fi

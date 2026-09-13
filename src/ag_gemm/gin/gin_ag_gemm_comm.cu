@@ -26,7 +26,8 @@ namespace bytedance::flux::gin_ag {
 namespace {
 
 constexpr int kThreads = 256;
-constexpr int kRingThreads = 32;
+constexpr int kWarpSize = 32;
+constexpr int kRingThreads = kWarpSize;
 
 __device__ __forceinline__ size_t
 chunk_nbytes(GinAgCommParams const &p, int split) {
@@ -167,7 +168,7 @@ gin_ag_gemm_comm_kernel(GinAgCommParams p) {
     // Sender-side source lifetime: all GIN reads from the AG window have retired.
     gin.flush(warps);
   } else {
-    ncclCoopWarpSpan warps(1, blockDim.x / WARP_SIZE - 1, 1);
+    ncclCoopWarpSpan warps(1, blockDim.x / kWarpSize - 1, 1);
 
     // Same ordering as the network warp: data peer first, then all chunks
     // assigned to this block. The LSA side consumes one additional rail peer
