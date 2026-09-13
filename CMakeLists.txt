@@ -33,11 +33,12 @@ set(NCCL_ROOT
     "${PROJECT_SOURCE_DIR}/3rdparty/nccl/build/local"
     CACHE PATH "NCCL installation root")
 option(ENABLE_GIN_AG "build NCCL GIN Rail-Ring AG+GEMM fusion" OFF)
+option(ENABLE_GIN_RS "build NCCL GIN Rail-A2A GEMM+ReduceScatter fusion" OFF)
 set(NCCL_DEVICE_INCLUDE_DIR "$ENV{NCCL_DEVICE_INCLUDE_DIR}" CACHE PATH
     "NCCL 2.30.x source/internal include directory containing nccl_device.h")
 set(NCCL_PUBLIC_INCLUDE_DIR "$ENV{NCCL_PUBLIC_INCLUDE_DIR}" CACHE PATH
     "NCCL installed include directory containing nccl.h")
-if(ENABLE_GIN_AG)
+if(ENABLE_GIN_AG OR ENABLE_GIN_RS)
   if(NOT NCCL_DEVICE_INCLUDE_DIR AND DEFINED ENV{NCCL_ROOT})
     if(EXISTS "$ENV{NCCL_ROOT}/src/include/nccl_device.h")
       set(NCCL_DEVICE_INCLUDE_DIR "$ENV{NCCL_ROOT}/src/include")
@@ -47,7 +48,7 @@ if(ENABLE_GIN_AG)
   endif()
   if(NOT EXISTS "${NCCL_DEVICE_INCLUDE_DIR}/nccl_device.h")
     message(FATAL_ERROR
-      "ENABLE_GIN_AG requires NCCL 2.30.x Device API headers. Set "
+      "GIN fusion requires NCCL 2.30.x Device API headers. Set "
       "NCCL_DEVICE_INCLUDE_DIR to the directory containing nccl_device.h "
       "(for a source tree: <nccl>/src/include).")
   endif()
@@ -59,7 +60,7 @@ if(ENABLE_GIN_AG)
   endif()
   if(NOT EXISTS "${NCCL_PUBLIC_INCLUDE_DIR}/nccl.h")
     message(FATAL_ERROR
-      "ENABLE_GIN_AG requires the matching NCCL public headers. Set "
+      "GIN fusion requires the matching NCCL public headers. Set "
       "NCCL_PUBLIC_INCLUDE_DIR to the directory containing nccl.h.")
   endif()
   # A source-tree nccl_device.h may enable the GDAKI backend on Hopper and
@@ -78,12 +79,19 @@ if(ENABLE_GIN_AG)
     NO_DEFAULT_PATH)
   if(NOT NCCL_STATIC_LIBRARY)
     message(FATAL_ERROR
-      "ENABLE_GIN_AG requires the matching libnccl_static.a under "
+      "GIN fusion requires the matching libnccl_static.a under "
       "${_NCCL_INSTALL_PREFIX}/lib. Build the selected NCCL tree first.")
   endif()
-  add_definitions(-DFLUX_ENABLE_GIN_AG)
-  message(STATUS "GIN AG enabled; NCCL Device API headers: ${NCCL_DEVICE_INCLUDE_DIR}")
-  message(STATUS "GIN AG NCCL static library: ${NCCL_STATIC_LIBRARY}")
+  if(ENABLE_GIN_AG)
+    add_definitions(-DFLUX_ENABLE_GIN_AG)
+    message(STATUS "GIN AG enabled")
+  endif()
+  if(ENABLE_GIN_RS)
+    add_definitions(-DFLUX_ENABLE_GIN_RS)
+    message(STATUS "GIN RS enabled")
+  endif()
+  message(STATUS "GIN NCCL Device API headers: ${NCCL_DEVICE_INCLUDE_DIR}")
+  message(STATUS "GIN NCCL static library: ${NCCL_STATIC_LIBRARY}")
 endif()
 message("PYTHONPATH: ${PYTHONPATH}")
 message("NVShmem Support: ${ENABLE_NVSHMEM}")
@@ -323,7 +331,7 @@ set(COMMON_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/library/include
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/profiler/include)
-if(ENABLE_GIN_AG)
+if(ENABLE_GIN_AG OR ENABLE_GIN_RS)
   list(APPEND COMMON_HEADER_DIRS
        ${NCCL_DEVICE_INCLUDE_DIR} ${NCCL_PUBLIC_INCLUDE_DIR} ${NCCL_DEVICE_AUX_INCLUDE_DIR})
 endif()

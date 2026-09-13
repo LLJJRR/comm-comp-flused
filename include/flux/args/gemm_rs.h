@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #pragma once
+#include <cstdint>
 namespace bytedance::flux {
 
 struct ReduceScatterArguments {
@@ -48,6 +49,10 @@ struct GemmReduceScatterArguments {
   void **output_scatter_ptrs;
   void **reduce_buffer_ptrs;
   void **barrier_ptrs = nullptr;
+  // Non-null only for the SM90 GIN RS path. The GEMM-side local reduction
+  // publishes one flag per (destination node, output tile) after all local
+  // GPU contributions are globally visible.
+  int32_t *gin_rs_ready = nullptr;
   int avail_sms = -1;
 
   void *Aux = nullptr;     // m * n

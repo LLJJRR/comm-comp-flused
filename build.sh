@@ -17,6 +17,7 @@ WITH_PROTOBUF="OFF"
 FLUX_DEBUG="OFF"
 ENABLE_NVSHMEM="OFF"
 ENABLE_GIN_AG="OFF"
+ENABLE_GIN_RS="OFF"
 WITH_TRITON_AOT="OFF"
 BUILD_PROFILE="all"
 FORCE_FULL_BUILD="OFF"
@@ -96,6 +97,14 @@ while [[ $# -gt 0 ]]; do
         fi
         shift
         ;;
+    --gin-rs)
+        ENABLE_GIN_RS="ON"
+        # GIN RS development defaults to the minimal GEMM/RS object target.
+        if [ "${BUILD_PROFILE}" = "all" ]; then
+            BUILD_PROFILE="gin-rs"
+        fi
+        shift
+        ;;
     --target)
         BUILD_PROFILE="$2"
         shift
@@ -134,6 +143,11 @@ case "${BUILD_PROFILE}" in
         BUILD_SCOPE="ag_gemm"
         CMAKE_BUILD_TARGET="flux_cuda_all_gather"
         ;;
+    gin-rs)
+        ENABLE_GIN_RS="ON"
+        BUILD_SCOPE="gemm_rs"
+        CMAKE_BUILD_TARGET="flux_cuda_reduce_scatter"
+        ;;
     ag-gemm)
         BUILD_SCOPE="ag_gemm"
         CMAKE_BUILD_TARGET="flux_cuda_all_gather"
@@ -162,7 +176,7 @@ case "${BUILD_PROFILE}" in
         ;;
     *)
         echo "Unknown --target profile: ${BUILD_PROFILE}" >&2
-        echo "Supported: all, gin-ag, ag-gemm, gemm-rs, gemm-a2a-transpose, a2a-transpose-gemm, moe-ag-scatter, moe-gather-rs" >&2
+        echo "Supported: all, gin-ag, gin-rs, ag-gemm, gemm-rs, gemm-a2a-transpose, a2a-transpose-gemm, moe-ag-scatter, moe-gather-rs" >&2
         exit 2
         ;;
 esac
@@ -246,6 +260,7 @@ function build_flux_cuda() {
         CMAKE_ARGS=(
             -DENABLE_NVSHMEM=${ENABLE_NVSHMEM}
             -DENABLE_GIN_AG=${ENABLE_GIN_AG}
+            -DENABLE_GIN_RS=${ENABLE_GIN_RS}
             -DFLUX_BUILD_SCOPE=${BUILD_SCOPE}
             -DNCCL_ROOT=${NCCL_INSTALL_ROOT}
             -DNCCL_DEVICE_INCLUDE_DIR=${NCCL_SOURCE_ROOT}/src/include
@@ -324,6 +339,11 @@ function build_flux_py {
     export NCCL_ROOT=${NCCL_INSTALL_ROOT}
     if [ $ENABLE_GIN_AG == "ON" ]; then
         export FLUX_ENABLE_GIN_AG=1
+    fi
+    if [ $ENABLE_GIN_RS == "ON" ]; then
+        export FLUX_ENABLE_GIN_RS=1
+    fi
+    if [ $ENABLE_GIN_AG == "ON" ] || [ $ENABLE_GIN_RS == "ON" ]; then
         export NCCL_DEVICE_INCLUDE_DIR=${NCCL_SOURCE_ROOT}/src/include
         export NCCL_PUBLIC_INCLUDE_DIR=${NCCL_INSTALL_ROOT}/include
     fi
@@ -342,7 +362,7 @@ function build_flux_py {
 }
 
 trap 'rc=$?; if [ "$rc" -eq 0 ]; then merge_compile_commands || true; fi; exit "$rc"' EXIT
-if [ "${ENABLE_GIN_AG}" = "ON" ] || [ "${BUILD_SCOPE}" = "all" ] || [ ! -f "${NCCL_INSTALL_ROOT}/include/nccl.h" ]; then
+if [ "${ENABLE_GIN_AG}" = "ON" ] || [ "${ENABLE_GIN_RS}" = "ON" ] || [ "${BUILD_SCOPE}" = "all" ] || [ ! -f "${NCCL_INSTALL_ROOT}/include/nccl.h" ]; then
     build_nccl
 else
     echo "Skip NCCL rebuild for minimal profile ${BUILD_PROFILE}; using ${NCCL_INSTALL_ROOT}"

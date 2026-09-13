@@ -17,6 +17,7 @@
 #include "gemm_rs/ths_op/gemm_reduce_scatter.h"
 #include "flux/args/gemm_rs.h"
 #include "flux/cuda/cuda_common.h"
+#include "flux/cuda/cuda_stub.h"
 #include "flux/flux.h"
 #include "flux/gemm_hparams.h"
 #include "flux/gemm_meta.h"
@@ -31,6 +32,7 @@
 #include "gemm_rs/tile_scheduler/threadblock_swizzle_segment_util.hpp"
 #include "gemm_rs/ths_op/helper_ops.h"
 #include <ATen/core/jit_type.h>
+#include <algorithm>
 #include <ATen/core/List.h>
 #include <ATen/cuda/CachingHostAllocator.h>
 #include <ATen/cuda/CUDAEvent.h>
@@ -51,9 +53,46 @@
 #ifdef FLUX_REDUCE_SCATTER_WITH_NCCL
 #include "nccl.h"
 #endif
+#ifdef FLUX_ENABLE_GIN_RS
+#include <nccl.h>
+#include <nccl_device.h>
+#include "gemm_rs/gin/gin_gemm_rs_comm.h"
+#endif
 
 namespace bytedance::flux::ths_op {
 using torch::Tensor;
+
+#ifdef FLUX_ENABLE_GIN_RS
+namespace {
+ncclComm_t
+create_gin_rs_nccl_comm(std::shared_ptr<Group> const &pg) {
+  ncclComm_t comm{};
+  ncclUniqueId id{};
+  if (pg->get_rank() == 0) NCCL_CHECK(ncclGetUniqueId(&id));
+  pg->broadcast_cpu(&id, sizeof(id), 0);
+  NCCL_CHECK(ncclCommInitRank(&comm, pg->get_size(), id, pg->get_rank()));
+  return comm;
+}
+
+size_t
+gin_rs_scalar_bytes(c10::ScalarType dtype) {
+  switch (dtype) {
+    case c10::ScalarType::Half:
+    case c10::ScalarType::BFloat16: return 2;
+    default: FLUX_CHECK(false) << "GIN GEMM+RS supports only FP16/BF16";
+  }
+  return 0;
+}
+
+gin_rs::DataType
+gin_rs_dtype(c10::ScalarType dtype) {
+  if (dtype == c10::ScalarType::Half) return gin_rs::DataType::FP16;
+  if (dtype == c10::ScalarType::BFloat16) return gin_rs::DataType::BF16;
+  FLUX_CHECK(false) << "GIN GEMM+RS supports only FP16/BF16";
+  return gin_rs::DataType::FP16;
+}
+}  // namespace
+#endif
 
 std::string
 to_string(const std::optional<bool> &value) {
@@ -109,6 +148,9 @@ class GemmRS::GemmRSImpl {
   const bool transpose_weight;
   const bool fuse_reduction;
   const bool ring_reduction;
+  const bool enable_gin_rs;
+  const int32_t gin_contexts;
+  const int64_t gin_chunk_bytes;
 
  private:
   const int32_t rank;
@@ -140,9 +182,99 @@ class GemmRS::GemmRSImpl {
   const bool is_fp8_gemm;
   const bool is_s8_gemm;
 
+#ifdef FLUX_ENABLE_GIN_RS
+  ncclComm_t gin_comm{};
+  ncclDevComm_t gin_dev_comm{};
+  ncclWindow_t gin_reduce_window{};
+  void *gin_reduce_ptr = nullptr;
+  size_t gin_reduce_bytes = 0;
+  int gin_reserved_blocks = 0;
+
+  torch::Tensor gin_output;
+  torch::Tensor gin_ready;
+  torch::Tensor gin_producer_signal;
+  torch::Tensor gin_resident_count;
+  cudaEvent_t gin_reset_done{};
+  cudaEvent_t gin_done{};
+  // Recorded on the caller/compute stream at the beginning of the next
+  // forward.  The private GIN stream waits on it before touching reusable
+  // output/control storage, so iteration N+1 cannot overwrite iteration N
+  // while normal same-stream consumers are still reading its output.
+  cudaEvent_t gin_reuse_ready{};
+  bool gin_has_previous_forward = false;
+#endif
+
 #ifdef FLUX_REDUCE_SCATTER_WITH_NCCL
   ncclComm_t nccl_comm;
 #endif
+
+#ifdef FLUX_ENABLE_GIN_RS
+  void
+  init_gin_rs() {
+    if (!enable_gin_rs) return;
+
+    FLUX_CHECK(get_arch() == _Sm90{}) << "GIN GEMM+RS currently targets SM90";
+    FLUX_CHECK(nnodes > 1) << "GIN Rail ReduceScatter requires multiple nodes";
+    FLUX_CHECK(fuse_reduction) << "GIN GEMM+RS requires fuse_reduction=true";
+    FLUX_CHECK(input_dtype == c10::ScalarType::Half || input_dtype == c10::ScalarType::BFloat16)
+        << "GIN GEMM+RS currently supports FP16/BF16";
+    FLUX_CHECK(output_dtype == input_dtype)
+        << "GIN GEMM+RS requires output_dtype == input_dtype";
+    FLUX_CHECK(gin_contexts > 0);
+    FLUX_CHECK(gin_chunk_bytes > 0);
+
+    gin_comm = create_gin_rs_nccl_comm(group_);
+    ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
+    NCCL_CHECK(ncclCommQueryProperties(gin_comm, &props));
+    FLUX_CHECK(props.deviceApiSupport) << "NCCL Device API is unavailable";
+    FLUX_CHECK(props.railedGinType != NCCL_GIN_TYPE_NONE) << "railed GIN backend is unavailable";
+
+    ncclTeam_t lsa = ncclTeamLsa(gin_comm);
+    ncclTeam_t rail = ncclTeamRail(gin_comm);
+    FLUX_CHECK(lsa.nRanks == local_world_size && lsa.rank == local_rank && lsa.stride == 1)
+        << "unexpected NCCL LSA mapping";
+    FLUX_CHECK(rail.nRanks == nnodes && rail.rank == node_idx && rail.stride == local_world_size)
+        << "unexpected NCCL rail mapping";
+
+    int device = -1;
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    gin_reserved_blocks = gin_contexts;
+    FLUX_CHECK(gin_reserved_blocks <= prop.multiProcessorCount)
+        << "GIN RS requires all progress CTAs resident before GEMM; requested "
+        << gin_reserved_blocks << " blocks on a GPU with " << prop.multiProcessorCount << " SMs";
+
+    ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    reqs.barrierCount = gin_reserved_blocks;
+    reqs.ginContextCount = gin_reserved_blocks;
+    reqs.ginSignalCount = gin_reserved_blocks * rail.nRanks;
+    reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
+    NCCL_CHECK(ncclDevCommCreate(gin_comm, &reqs, &gin_dev_comm));
+    FLUX_CHECK(gin_dev_comm.ginContextCount >= gin_reserved_blocks);
+    FLUX_CHECK(gin_dev_comm.ginSignalCount >= reqs.ginSignalCount);
+
+    int reduce_m_dim = (max_m + world_size - 1) / world_size * nnodes * nnodes;
+    gin_reduce_bytes = size_t(reduce_m_dim) * size_t(n_dim) * gin_rs_scalar_bytes(output_dtype);
+    NCCL_CHECK(ncclMemAlloc(&gin_reduce_ptr, gin_reduce_bytes));
+    NCCL_CHECK(ncclCommWindowRegister(
+        gin_comm, gin_reduce_ptr, gin_reduce_bytes, &gin_reduce_window, NCCL_WIN_COLL_SYMMETRIC));
+    FLUX_CHECK(gin_reduce_window != nullptr)
+        << "GIN GEMM+RS requires NCCL collective symmetric window support";
+
+    auto dev = at::TensorOptions(output_dtype).device(at::kCUDA).device_index(at::cuda::current_device());
+    int max_m_rank = (max_m + world_size - 1) / world_size;
+    gin_output = torch::empty({max_m_rank, n_dim}, dev);
+    gin_producer_signal = torch::zeros(
+        {1}, at::TensorOptions(at::ScalarType::Int).device(at::kCUDA));
+    gin_resident_count = torch::zeros(
+        {1}, at::TensorOptions(at::ScalarType::Int).device(at::kCUDA));
+    CUDA_CHECK(cudaEventCreateWithFlags(&gin_reset_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&gin_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&gin_reuse_ready, cudaEventDisableTiming));
+  }
+#endif
+
   void
   init_output_buffer() {
     // update max_m and allocate buffer
@@ -150,27 +282,41 @@ class GemmRS::GemmRSImpl {
       int reduce_m_dim = (get_arch() == _Sm90{} && fuse_reduction)
                              ? (max_m + world_size - 1) / world_size * nnodes * nnodes
                              : max_m;
-      this->reduce_buffers =
-          flux_create_tensor_list({reduce_m_dim, n_dim}, output_dtype, this->group_.get());
-      static bool use_shm = get_bool_from_env("FLUX_RS_USE_SHM", false);
-      if (use_shm) {
-        this->reduce_buffers_pin =
-            flux_create_shm_tensor_list({reduce_m_dim, n_dim}, output_dtype, this->group_.get());
-      }
-      this->reduce_buffer = this->reduce_buffers[this->local_rank];
-      for (int i = 0; i < world_size; i++) {
-        if (i / this->local_world_size == rank / this->local_world_size) {
-          if (use_shm && this->world_size != this->sub_world_size &&
-              (i + 1) % this->sub_world_size == 0) {
-            reduce_buffer_ptrs[i] =
-                this->reduce_buffers_pin[i % this->local_world_size].data_ptr();
+#ifdef FLUX_ENABLE_GIN_RS
+      if (enable_gin_rs) {
+        auto options = at::TensorOptions(output_dtype)
+                           .device(at::kCUDA)
+                           .device_index(at::cuda::current_device());
+        this->reduce_buffer = at::from_blob(
+            gin_reduce_ptr, {reduce_m_dim, n_dim}, [](void *) {}, options);
+        std::fill(reduce_buffer_ptrs.begin(), reduce_buffer_ptrs.end(), nullptr);
+        // SM90's fused DMA consumes only the current GPU's local reduction
+        // buffer. Cross-node visibility comes from the NCCL symmetric window.
+        reduce_buffer_ptrs[rank] = gin_reduce_ptr;
+      } else
+#endif
+      {
+        this->reduce_buffers =
+            flux_create_tensor_list({reduce_m_dim, n_dim}, output_dtype, this->group_.get());
+        static bool use_shm = get_bool_from_env("FLUX_RS_USE_SHM", false);
+        if (use_shm) {
+          this->reduce_buffers_pin =
+              flux_create_shm_tensor_list({reduce_m_dim, n_dim}, output_dtype, this->group_.get());
+        }
+        this->reduce_buffer = this->reduce_buffers[this->local_rank];
+        for (int i = 0; i < world_size; i++) {
+          if (i / this->local_world_size == rank / this->local_world_size) {
+            if (use_shm && this->world_size != this->sub_world_size &&
+                (i + 1) % this->sub_world_size == 0) {
+              reduce_buffer_ptrs[i] =
+                  this->reduce_buffers_pin[i % this->local_world_size].data_ptr();
+            } else {
+              reduce_buffer_ptrs[i] = this->reduce_buffers[i % this->local_world_size].data_ptr();
+            }
+            FLUX_CHECK(reduce_buffer_ptrs[i] != nullptr) << "nullptr buffer of rank " << i;
           } else {
-            reduce_buffer_ptrs[i] = this->reduce_buffers[i % this->local_world_size].data_ptr();
+            reduce_buffer_ptrs[i] = nullptr;
           }
-          // only check for ranks on the same node
-          FLUX_CHECK(reduce_buffer_ptrs[i] != nullptr) << "nullptr buffer of rank " << i;
-        } else {
-          reduce_buffer_ptrs[i] = nullptr;
         }
       }
     }
@@ -341,7 +487,10 @@ class GemmRS::GemmRSImpl {
       c10::ScalarType output_dtype,
       bool transpose_weight,
       bool fuse_reduction,
-      bool ring_reduction)
+      bool ring_reduction,
+      bool enable_gin_rs_,
+      int32_t gin_contexts_,
+      int64_t gin_chunk_bytes_)
       : group_(group_),
         nnodes(nnodes),
         max_m(max_m),
@@ -351,6 +500,9 @@ class GemmRS::GemmRSImpl {
         transpose_weight(transpose_weight),
         fuse_reduction(fuse_reduction),
         ring_reduction(ring_reduction),
+        enable_gin_rs(enable_gin_rs_),
+        gin_contexts(gin_contexts_),
+        gin_chunk_bytes(gin_chunk_bytes_),
         rank(group_->get_rank()),
         world_size(group_->get_size()),
         local_world_size(world_size / nnodes),
@@ -375,9 +527,14 @@ class GemmRS::GemmRSImpl {
             std::to_string(nnodes) + "] != 0");
 
     TORCH_CHECK(
-        !fuse_reduction || input_dtype == at::ScalarType::Half,
-        "Fuse reduction only support float16 type on SM80 due to instruction limitation.");
+        get_arch() != _Sm80{} || !fuse_reduction || input_dtype == at::ScalarType::Half,
+        "Fuse reduction only supports float16 on SM80 due to instruction limitation.");
 
+#ifndef FLUX_ENABLE_GIN_RS
+    TORCH_CHECK(!enable_gin_rs, "Flux was built without FLUX_ENABLE_GIN_RS");
+#else
+    this->init_gin_rs();
+#endif
     this->init_output_buffer();
     CUDA_CHECK(cudaEventCreate(&event_));
 #if defined(FLUX_DEBUG)
@@ -408,6 +565,21 @@ class GemmRS::GemmRSImpl {
   }
 
   ~GemmRSImpl() {
+#ifdef FLUX_ENABLE_GIN_RS
+    if (enable_gin_rs) {
+      CUDA_CHECK(cudaStreamSynchronize(rs_stream_));
+      if (gin_dev_comm.magic) NCCL_CHECK(ncclDevCommDestroy(gin_comm, &gin_dev_comm));
+      if (gin_reduce_window) NCCL_CHECK(ncclCommWindowDeregister(gin_comm, gin_reduce_window));
+      if (gin_reduce_ptr) NCCL_CHECK(ncclMemFree(gin_reduce_ptr));
+      if (gin_comm) {
+        ncclCommFinalize(gin_comm);
+        ncclCommDestroy(gin_comm);
+      }
+      if (gin_reset_done) CUDA_CHECK(cudaEventDestroy(gin_reset_done));
+      if (gin_done) CUDA_CHECK(cudaEventDestroy(gin_done));
+      if (gin_reuse_ready) CUDA_CHECK(cudaEventDestroy(gin_reuse_ready));
+    }
+#endif
     CUDA_CHECK(cudaEventDestroy(event_));
     CUDA_CHECK(cudaStreamDestroy(rs_stream_));
 #ifdef FLUX_REDUCE_SCATTER_WITH_NCCL
@@ -549,6 +721,113 @@ class GemmRS::GemmRSImpl {
     }
   }
 
+#ifdef FLUX_ENABLE_GIN_RS
+  int32_t *
+  prepare_gin_rs(
+      UnifiedGemmHParams const &hparams,
+      int m,
+      int n,
+      cudaStream_t compute_stream) {
+    if (!enable_gin_rs) return nullptr;
+
+    auto [tile_m, tile_n, tile_k] = hparams.tile_shape();
+    (void)tile_k;
+    FLUX_CHECK(m % (tile_m * world_size) == 0)
+        << "GIN RS requires M divisible by tile_M * world_size";
+    FLUX_CHECK(n % tile_n == 0) << "GIN RS requires N divisible by tile_N";
+    FLUX_CHECK(tile_n % 8 == 0)
+        << "GIN RS 128-bit final reduction requires tile_N divisible by 8 for FP16/BF16";
+
+    int m_rank = m / world_size;
+    int tiles_m_per_rank = m_rank / tile_m;
+    int n_tiles = n / tile_n;
+    int tiles_per_rank = tiles_m_per_rank * n_tiles;
+    FLUX_CHECK(tiles_per_rank > 0);
+
+    size_t element_bytes = gin_rs_scalar_bytes(output_dtype);
+    size_t tile_bytes = size_t(tile_m) * size_t(tile_n) * element_bytes;
+    size_t slot_bytes = size_t(m_rank) * size_t(n) * element_bytes;
+    int64_t tiles_per_chunk64 = std::max<int64_t>(1, gin_chunk_bytes / int64_t(tile_bytes));
+    int tiles_per_chunk = int(std::min<int64_t>(tiles_per_chunk64, tiles_per_rank));
+    int chunks_per_rank = (tiles_per_rank + tiles_per_chunk - 1) / tiles_per_chunk;
+    int nblocks = std::max(1, std::min(gin_reserved_blocks, chunks_per_rank));
+
+    int64_t ready_count = int64_t(nnodes) * tiles_per_rank;
+    if (!gin_ready.defined() || gin_ready.numel() < ready_count) {
+      // Resizing control storage is rare (shape/tuning change) and must not
+      // invalidate memory still referenced by a previous progress kernel.
+      CUDA_CHECK(cudaStreamSynchronize(rs_stream_));
+      gin_ready = torch::empty(
+          {ready_count}, at::TensorOptions(at::ScalarType::Int).device(at::kCUDA));
+    }
+    FLUX_CHECK(gin_output.size(0) >= m_rank && gin_output.size(1) == n);
+
+    cudaStream_t comm_stream = rs_stream_;
+
+    // gin_output, gin_ready and the symmetric reduce window are deliberately
+    // reused across forwards.  forward_gemm_impl() makes the caller stream
+    // wait for gin_done before returning the output, but that only orders the
+    // producer.  The caller may enqueue ordinary consumers of the returned
+    // tensor afterwards.  At the beginning of the next forward, record an
+    // event *after* those same-stream consumers and make the private GIN stream
+    // wait before it resets control state or enters the next world barrier.
+    // This closes the N -> N+1 overwrite race without synchronizing the host.
+    if (gin_has_previous_forward) {
+      CUDA_CHECK(cudaEventRecord(gin_reuse_ready, compute_stream));
+      CUDA_CHECK(cudaStreamWaitEvent(comm_stream, gin_reuse_ready, 0));
+    }
+
+    CUDA_CHECK(cudaMemsetAsync(
+        gin_ready.data_ptr(), 0, ready_count * sizeof(int32_t), comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(gin_producer_signal.data_ptr(), 0, sizeof(int32_t), comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(gin_resident_count.data_ptr(), 0, sizeof(int32_t), comm_stream));
+
+    // Compute must not publish a new tile against stale ready=1 values.
+    CUDA_CHECK(cudaEventRecord(gin_reset_done, comm_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, gin_reset_done, 0));
+
+    gin_rs::GinRsCommParams params;
+    params.dev_comm = gin_dev_comm;
+    params.reduce_window = gin_reduce_window;
+    params.output = gin_output.data_ptr();
+    params.ready = gin_ready.data_ptr<int32_t>();
+    params.rank = rank;
+    params.world_size = world_size;
+    params.local_world_size = local_world_size;
+    params.nnodes = nnodes;
+    params.node_idx = node_idx;
+    params.m_rank = m_rank;
+    params.n_dim = n;
+    params.tile_m = tile_m;
+    params.tile_n = tile_n;
+    params.tiles_m_per_rank = tiles_m_per_rank;
+    params.n_tiles = n_tiles;
+    params.tiles_per_rank = tiles_per_rank;
+    params.tiles_per_chunk = tiles_per_chunk;
+    params.chunks_per_rank = chunks_per_rank;
+    params.nblocks = nblocks;
+    params.element_bytes = element_bytes;
+    params.tile_bytes = tile_bytes;
+    params.slot_bytes = slot_bytes;
+    params.producer_signal = gin_producer_signal.data_ptr<int32_t>();
+    params.resident_count = gin_resident_count.data_ptr<int32_t>();
+
+    gin_rs::launch_gin_gemm_rs_comm(params, gin_rs_dtype(output_dtype), comm_stream);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(gin_done, comm_stream));
+
+    // The progress CTAs must become resident before persistent GEMM launches;
+    // otherwise GEMM can occupy every SM and deadlock waiting for GIN progress.
+    CU_CHECK(CUStreamWaitValue(
+        compute_stream,
+        (CUdeviceptr)gin_producer_signal.data_ptr<int32_t>(),
+        1,
+        CU_STREAM_WAIT_VALUE_EQ));
+    gin_has_previous_forward = true;
+    return gin_ready.data_ptr<int32_t>();
+  }
+#endif
+
   void
   forward_gemm_impl(
       torch::Tensor input,
@@ -586,6 +865,13 @@ class GemmRS::GemmRSImpl {
     };
     auto stream = c10::cuda::getCurrentCUDAStream();
 
+    int32_t *gin_rs_ready_ptr = nullptr;
+#ifdef FLUX_ENABLE_GIN_RS
+    if (enable_gin_rs) {
+      gin_rs_ready_ptr = prepare_gin_rs(hparams_, rt_conf.m(), rt_conf.n(), stream);
+    }
+#endif
+
     if (!is_fp8_gemm && !is_s8_gemm) {
       FLUX_CHECK(!input_scale.has_value());
       FLUX_CHECK(!weight_scale.has_value());
@@ -617,6 +903,7 @@ class GemmRS::GemmRSImpl {
         .output_scatter_ptrs = this->output_scatter_ptrs.data(),
         .reduce_buffer_ptrs = this->reduce_buffer_ptrs.data(),
         .barrier_ptrs = this->barrier_ptrs.data(),
+        .gin_rs_ready = gin_rs_ready_ptr,
         .avail_sms = no_nvlink ? 1 : -1,
         .Aux = nullptr,
         .Vector = bias.has_value() ? bias->data_ptr() : nullptr,
@@ -656,8 +943,15 @@ class GemmRS::GemmRSImpl {
       zero_buffers();
     }
     cutlass_op->run(args, workspace, stream);
+#ifdef FLUX_ENABLE_GIN_RS
+    if (enable_gin_rs) {
+      // Preserve normal PyTorch stream semantics: consumers of the returned
+      // tensor on the current stream cannot pass the final GIN reduction.
+      CUDA_CHECK(cudaStreamWaitEvent(stream, gin_done, 0));
+    }
+#endif
 
-  }  // namespace ths_op
+  }
 
   torch::Tensor
   local_reduction(torch::Tensor buffer, int32_t dim, int32_t rank, bool ring_reduction) {
@@ -708,6 +1002,12 @@ class GemmRS::GemmRSImpl {
 
     int m = rt_conf.m();
     int n = rt_conf.n();
+
+#ifdef FLUX_ENABLE_GIN_RS
+    if (enable_gin_rs) {
+      return gin_output.slice(0, 0, m / world_size);
+    }
+#endif
 
     if (((int)get_arch() < (int)_Sm90{}())) {
       auto full_output = this->output_buffer.slice(0, 0, m);
@@ -833,6 +1133,13 @@ class GemmRS::GemmRSImpl {
   void
   forward_barrier(torch::Tensor input, torch::Tensor weight, c10::optional<torch::Tensor> bias) {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+#ifdef FLUX_ENABLE_GIN_RS
+    if (enable_gin_rs) {
+      // The persistent GIN kernel owns cross-node begin/end barriers and the
+      // compute stream already waits for gin_done after GEMM.
+      return;
+    }
+#endif
     if (get_arch() == _Sm90{} and nnodes == 1) {
       // only local reduce, skip nvshmem barrier
     } else {
@@ -993,7 +1300,10 @@ GemmRS::GemmRS(
     c10::ScalarType output_dtype,
     bool transpose_weight,
     bool fuse_reduction,
-    bool ring_reduction)
+    bool ring_reduction,
+    bool enable_gin_rs,
+    int32_t gin_contexts,
+    int64_t gin_chunk_bytes)
     : impl_(new GemmRSImpl(
           group,
           nnodes,
@@ -1003,7 +1313,10 @@ GemmRS::GemmRS(
           output_dtype,
           transpose_weight,
           fuse_reduction,
-          ring_reduction)) {}
+          ring_reduction,
+          enable_gin_rs,
+          gin_contexts,
+          gin_chunk_bytes)) {}
 GemmRS::~GemmRS() { delete impl_; }
 void
 GemmRS::zero_buffers() {

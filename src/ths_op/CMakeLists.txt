@@ -17,7 +17,7 @@ endif()
 target_link_libraries(flux_cuda_ths_op
     flux_cuda
     ${TORCH_LIBRARIES} ${TRITON_AOT_LIB})
-if(ENABLE_GIN_AG)
+if(ENABLE_GIN_AG OR ENABLE_GIN_RS)
   # cpp_mod.py preloads libflux_cuda_ths_op.so before importing the pybind
   # extension. Resolve the NCCL 2.30.x Device API symbols here against the
   # exact patched static library instead of relying on whichever NCCL PyTorch

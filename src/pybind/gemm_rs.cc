@@ -37,7 +37,10 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
                         py::object py_output_dtype,
                         bool transpose_weight,
                         bool fuse_reduction,
-                        bool ring_reduction) {
+                        bool ring_reduction,
+                        bool enable_gin_rs,
+                        int32_t gin_contexts,
+                        int64_t gin_chunk_bytes) {
               auto output_dtype = py_output_dtype.is(py::none())
                                       ? input_dtype
                                       : torch::python::detail::py_object_to_dtype(py_output_dtype);
@@ -51,7 +54,10 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
                   output_dtype,
                   transpose_weight,
                   fuse_reduction,
-                  ring_reduction);
+                  ring_reduction,
+                  enable_gin_rs,
+                  gin_contexts,
+                  gin_chunk_bytes);
             }),
             py::arg("tp_group"),
             py::arg("nnodes"),
@@ -61,7 +67,10 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
             py::arg("output_dtype") = py::none(),
             py::arg("transpose_weight") = false,
             py::arg("fuse_reduction") = false,
-            py::arg("ring_reduction") = false)
+            py::arg("ring_reduction") = false,
+            py::arg("enable_gin_rs") = false,
+            py::arg("gin_contexts") = 4,
+            py::arg("gin_chunk_bytes") = 1 << 20)
         .def("zero_buffers", &GemmRSOpCls::zero_buffers)
         .def(
             "forward",

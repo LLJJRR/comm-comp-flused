@@ -322,6 +322,9 @@ class GemmRS:
         transpose_weight=False,
         fuse_reduction=False,
         ring_reduction=False,
+        enable_gin_rs: bool = False,
+        gin_contexts: int = 4,
+        gin_chunk_bytes: int = 1 << 20,
     ):
         """The formula:
         * matmul(input, weight) * input_scale * weight_scale + bias   if transpose_weight=True

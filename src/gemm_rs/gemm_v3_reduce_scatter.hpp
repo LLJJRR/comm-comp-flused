@@ -404,7 +404,8 @@ class GemmV3ReduceScatter_Device
           .world_size = args.world_size,
           .nnodes = args.nnodes,
           .local_reduce_buffer = args.reduce_buffer_ptrs[args.rank],
-          .barrier_ptrs = ptr_barrier};
+          .barrier_ptrs = ptr_barrier,
+          .gin_rs_ready = args.gin_rs_ready};
     }
     return gemm_args;
   }
@@ -537,7 +538,8 @@ class GemmV3ReduceScatter_Device
           .world_size = args.world_size,
           .nnodes = args.nnodes,
           .local_reduce_buffer = args.reduce_buffer_ptrs[args.rank],
-          .barrier_ptrs = ptr_barrier};
+          .barrier_ptrs = ptr_barrier,
+          .gin_rs_ready = args.gin_rs_ready};
     }
     return gemm_args;
   }

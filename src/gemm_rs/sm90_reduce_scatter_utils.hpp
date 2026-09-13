@@ -20,6 +20,7 @@
 #include "cute/layout.hpp"
 #include "cute/numeric/int.hpp"
 #include "cutlass/barrier.h"
+#include <cuda/atomic>
 #include "cutlass/cutlass.h"
 #include "cutlass/detail/helper_macros.hpp"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
@@ -92,6 +93,7 @@ struct Sm90ReduceScatterDma {
     int nnodes = 1;
     void *local_reduce_buffer = nullptr;
     int **barrier_ptrs;
+    int32_t *gin_rs_ready = nullptr;
   };
 
   struct Params {
@@ -118,6 +120,7 @@ struct Sm90ReduceScatterDma {
     TMA_Fetch tma_load_fetch[kMaxLocalWorldSize];
     Element *local_reduce_buffer;
     int *local_barrier_ptr[kMaxLocalWorldSize];
+    int32_t *gin_rs_ready;
     Layout<Shape<int, int>> tile_layout;
   };
 
@@ -162,6 +165,7 @@ struct Sm90ReduceScatterDma {
     params.stride = args.stride;
 
     params.local_reduce_buffer = static_cast<Element *>(args.local_reduce_buffer);
+    params.gin_rs_ready = args.gin_rs_ready;
     for (int local_rank = 0; local_rank < params.local_world_size; ++local_rank) {
       int global_rank = params.node_idx * params.local_world_size + local_rank;
       Element *ptr = static_cast<Element *>(args.output_scatter_ptrs[global_rank]);
@@ -425,7 +429,26 @@ struct Sm90ReduceScatterDma {
       if (reduce_count == params_ptr->local_world_size) {
         Barrier::wait_eq_reset(lock_ptr, thread_idx, flag_idx, params_ptr->local_world_size, 0);
         if constexpr (CommKind == _InterNode{}) {
-          if (dst_node_idx != params_ptr->node_idx) {
+          if (params_ptr->gin_rs_ready != nullptr) {
+            // GIN transport is handled by a persistent communication CTA.  Publish
+            // only after every lane's local-reduction stores are system-visible.
+            // The reduce buffer is tile-major (the existing NVSHMEM path already
+            // sends gReduce as one contiguous tile), so tile_id is also the block
+            // index consumed by the final blocked-to-dense reduction.
+            __syncwarp();
+            __threadfence_system();
+            __syncwarp();
+            if (thread_idx == 0) {
+              int n_tiles = size<1>(params_ptr->tile_layout.shape());
+              int tile_m_in_rank = m % params_ptr->tile_m_perrank;
+              int tile_id = tile_m_in_rank * n_tiles + n;
+              int tiles_per_rank = params_ptr->tile_m_perrank * n_tiles;
+              int ready_idx = dst_node_idx * tiles_per_rank + tile_id;
+              cuda::atomic_ref<int32_t, cuda::thread_scope_system> ready(
+                  params_ptr->gin_rs_ready[ready_idx]);
+              ready.store(1, cuda::memory_order_release);
+            }
+          } else if (dst_node_idx != params_ptr->node_idx) {
             int remote_rank = dst_node_idx * params_ptr->local_world_size + params_ptr->local_rank;
 #ifdef FLUX_SHM_USE_NVSHMEM
             nvshmemx_putmem_nbi_warp(

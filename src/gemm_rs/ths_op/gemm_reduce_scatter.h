@@ -33,7 +33,10 @@ class GemmRS {
       c10::ScalarType output_dtype,
       bool transpose_weight,
       bool fuse_reduction,
-      bool ring_reduction);
+      bool ring_reduction,
+      bool enable_gin_rs = false,
+      int32_t gin_contexts = 4,
+      int64_t gin_chunk_bytes = 1 << 20);
   ~GemmRS();
   void zero_buffers();
   torch::Tensor forward(
