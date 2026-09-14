@@ -127,9 +127,10 @@ elseif(FLUX_BUILD_SCOPE STREQUAL "ag_gemm")
   endif()
   add_subdirectory(ag_gemm)
 elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_rs")
-  if(FLUX_BUILD_RUNNABLE)
-    add_subdirectory(coll)
-  endif()
+  # GemmRS only needs coll/ths_op/reduce_scatter_op.h for the option/type
+  # definitions.  That header is consumed directly from the source include
+  # path; linking the full flux_coll target would unnecessarily compile AG,
+  # dispatch-scatter and all-to-all support in a GIN-RS-only runnable build.
   add_subdirectory(gemm_rs)
 elseif(FLUX_BUILD_SCOPE STREQUAL "gin_fusions")
   if(NOT ENABLE_GIN_AG OR NOT ENABLE_GIN_RS)
