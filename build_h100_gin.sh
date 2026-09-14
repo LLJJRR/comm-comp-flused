@@ -103,10 +103,10 @@ export NCCL_ROOT=${NCCL_INSTALL_ROOT}
 export NCCL_DEVICE_INCLUDE_DIR=${NCCL_SOURCE_ROOT}/src/include
 export NCCL_PUBLIC_INCLUDE_DIR=${NCCL_INSTALL_ROOT}/include
 export PYTHONPATH=${FLUX_DIR}/python:\${PYTHONPATH:-}
-export LD_PRELOAD=${CUDA_HOME}/lib64/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}
 export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:${NCCL_INSTALL_ROOT}/lib:${CUDA_HOME}/lib64:\${LD_LIBRARY_PATH:-}
 export FLUX_SHM_USE_NVSHMEM=1
 export FLUX_ENABLE_GIN_AG=1
+export FLUX_ENABLE_GIN_RS=1
 ENVEOF
 }
 
@@ -129,6 +129,7 @@ fi
 ########################################
 ./build.sh \
     --gin-ag \
+    --gin-rs \
     --full \
     --arch 90 \
     --sm-cores 132 \
