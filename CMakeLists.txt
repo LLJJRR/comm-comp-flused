@@ -25,10 +25,12 @@ set(FLUX_DEBUG
 option(WITH_PROTOBUF "build with protobuf" OFF)
 option(WITH_TRITON_AOT "build with triton Ahead-of-Time" OFF)
 set(FLUX_BUILD_SCOPE "all" CACHE STRING
-    "Build scope: all, comm_none, ag_gemm, gemm_rs, gemm_a2a_transpose, a2a_transpose_gemm, moe_ag_scatter, moe_gather_rs")
+    "Build scope: all, comm_none, ag_gemm, gemm_rs, gin_fusions, gemm_a2a_transpose, a2a_transpose_gemm, moe_ag_scatter, moe_gather_rs")
 set_property(CACHE FLUX_BUILD_SCOPE PROPERTY STRINGS
-    all comm_none ag_gemm gemm_rs gemm_a2a_transpose a2a_transpose_gemm
+    all comm_none ag_gemm gemm_rs gin_fusions gemm_a2a_transpose a2a_transpose_gemm
     moe_ag_scatter moe_gather_rs)
+option(FLUX_BUILD_RUNNABLE
+    "For a narrow FLUX_BUILD_SCOPE, also build/install core + THS runtime libraries" OFF)
 set(NCCL_ROOT
     "${PROJECT_SOURCE_DIR}/3rdparty/nccl/build/local"
     CACHE PATH "NCCL installation root")
@@ -321,11 +323,45 @@ string(REGEX REPLACE "sm_90" "sm_90a" CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS})
 string(REGEX REPLACE "compute_90" "compute_90a" CMAKE_CUDA_FLAGS
                      ${CMAKE_CUDA_FLAGS})
 
+# CUDA 13 moved CCCL's cuda/std, CUB and Thrust headers under include/cccl.
+# nvcc can discover that directory internally, but ordinary host-C++ targets
+# (for example src/cuda/op_registry_proto_utils.cc and the pybind extension)
+# cannot.  Detect the actual toolkit path instead of hard-coding /usr/local/cuda.
+set(FLUX_CCCL_INCLUDE_DIR "")
+if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+  set(_FLUX_CCCL_HINTS "")
+  foreach(_cuda_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    list(APPEND _FLUX_CCCL_HINTS "${_cuda_inc}/cccl")
+  endforeach()
+  if(DEFINED CUDAToolkit_TARGET_DIR)
+    list(APPEND _FLUX_CCCL_HINTS "${CUDAToolkit_TARGET_DIR}/include/cccl")
+  endif()
+  if(DEFINED CMAKE_CUDA_COMPILER_TOOLKIT_ROOT)
+    list(APPEND _FLUX_CCCL_HINTS "${CMAKE_CUDA_COMPILER_TOOLKIT_ROOT}/include/cccl")
+  endif()
+  if(DEFINED ENV{CUDA_HOME})
+    list(APPEND _FLUX_CCCL_HINTS "$ENV{CUDA_HOME}/include/cccl")
+  endif()
+
+  unset(_FLUX_CCCL_INCLUDE_FOUND CACHE)
+  find_path(_FLUX_CCCL_INCLUDE_FOUND
+    NAMES cuda/std/utility
+    HINTS ${_FLUX_CCCL_HINTS})
+  if(NOT _FLUX_CCCL_INCLUDE_FOUND)
+    message(FATAL_ERROR
+      "CUDA ${CUDAToolkit_VERSION} requires CCCL headers, but cuda/std/utility "
+      "was not found. Checked: ${_FLUX_CCCL_HINTS}")
+  endif()
+  set(FLUX_CCCL_INCLUDE_DIR "${_FLUX_CCCL_INCLUDE_FOUND}")
+  message(STATUS "CUDA 13 CCCL include: ${FLUX_CCCL_INCLUDE_DIR}")
+endif()
+
 set(COMMON_HEADER_DIRS
     ${NCCL_ROOT}/include
     ${NCCL_ROOT}/include/nccl/detail/include
     ${PROJECT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
+    ${FLUX_CCCL_INCLUDE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/include
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/util/include

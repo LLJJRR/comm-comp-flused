@@ -157,6 +157,19 @@ def flux_cuda_deps():
 def cuda_deps():
     cuda_home = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda"))
     include_dirs = [cuda_home / "include"]
+
+    # CUDA 13 moved CCCL headers (cuda/std, CUB, Thrust) under include/cccl.
+    # torch.utils.cpp_extension drives a host C++ compiler here, so unlike nvcc
+    # it does not discover the new directory automatically.
+    cccl_candidates = [cuda_home / "include" / "cccl"]
+    targets_dir = cuda_home / "targets"
+    if targets_dir.is_dir():
+        cccl_candidates.extend(targets_dir.glob("*/include/cccl"))
+    for cccl_dir in cccl_candidates:
+        if (cccl_dir / "cuda" / "std" / "utility").is_file():
+            include_dirs.append(cccl_dir)
+            break
+
     library_dirs = [cuda_home / "lib64", cuda_home / "lib64/stubs"]
     libraries = ["cuda", "cudart", "nvidia-ml"]
     return include_dirs, library_dirs, libraries

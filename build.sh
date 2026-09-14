@@ -21,6 +21,9 @@ ENABLE_GIN_RS="OFF"
 WITH_TRITON_AOT="OFF"
 BUILD_PROFILE="all"
 FORCE_FULL_BUILD="OFF"
+RUNNABLE_BUILD="OFF"
+TARGET_EXPLICIT="OFF"
+MAKE_VERBOSE=${MAKE_VERBOSE:-0}
 
 function clean_py() {
     rm -rf build/lib.*
@@ -90,24 +93,20 @@ while [[ $# -gt 0 ]]; do
         ;;
     --gin-ag)
         ENABLE_GIN_AG="ON"
-        # GIN AG development defaults to the minimal AG/GEMM object target.
-        # Use --full to retain the historical full Flux + Python build.
-        if [ "${BUILD_PROFILE}" = "all" ]; then
-            BUILD_PROFILE="gin-ag"
-        fi
         shift
         ;;
     --gin-rs)
         ENABLE_GIN_RS="ON"
-        # GIN RS development defaults to the minimal GEMM/RS object target.
-        if [ "${BUILD_PROFILE}" = "all" ]; then
-            BUILD_PROFILE="gin-rs"
-        fi
         shift
         ;;
     --target)
         BUILD_PROFILE="$2"
+        TARGET_EXPLICIT="ON"
         shift
+        shift
+        ;;
+    --runnable)
+        RUNNABLE_BUILD="ON"
         shift
         ;;
     --full)
@@ -126,13 +125,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ "${FORCE_FULL_BUILD}" = "ON" ]; then
-    BUILD_PROFILE="all"
+if [ "${FORCE_FULL_BUILD}" = "ON" ] && [ "${RUNNABLE_BUILD}" = "ON" ]; then
+    echo "ERROR: --full and --runnable are mutually exclusive" >&2
+    exit 2
 fi
 
-# Map user-facing fusion profiles to the smallest CMake object-library target.
-# Minimal profiles are compile-check/development modes: they intentionally skip
-# aggregate install and Python bindings, which would pull every Flux op back in.
+if [ "${FORCE_FULL_BUILD}" = "ON" ]; then
+    BUILD_PROFILE="all"
+elif [ "${TARGET_EXPLICIT}" = "OFF" ]; then
+    if [ "${ENABLE_GIN_AG}" = "ON" ] && [ "${ENABLE_GIN_RS}" = "ON" ]; then
+        BUILD_PROFILE="gin-both"
+    elif [ "${ENABLE_GIN_AG}" = "ON" ]; then
+        BUILD_PROFILE="gin-ag"
+    elif [ "${ENABLE_GIN_RS}" = "ON" ]; then
+        BUILD_PROFILE="gin-rs"
+    fi
+fi
+
+# Map user-facing fusion profiles to the smallest CMake scope.  With --runnable
+# we keep that narrow scope, but also build/install the core shared libraries,
+# Torch/pybind glue and editable Python package needed to execute the operator.
 BUILD_SCOPE="all"
 CMAKE_BUILD_TARGET=""
 case "${BUILD_PROFILE}" in
@@ -147,6 +159,12 @@ case "${BUILD_PROFILE}" in
         ENABLE_GIN_RS="ON"
         BUILD_SCOPE="gemm_rs"
         CMAKE_BUILD_TARGET="flux_cuda_reduce_scatter"
+        ;;
+    gin-both)
+        ENABLE_GIN_AG="ON"
+        ENABLE_GIN_RS="ON"
+        BUILD_SCOPE="gin_fusions"
+        CMAKE_BUILD_TARGET=""
         ;;
     ag-gemm)
         BUILD_SCOPE="ag_gemm"
@@ -176,14 +194,21 @@ case "${BUILD_PROFILE}" in
         ;;
     *)
         echo "Unknown --target profile: ${BUILD_PROFILE}" >&2
-        echo "Supported: all, gin-ag, gin-rs, ag-gemm, gemm-rs, gemm-a2a-transpose, a2a-transpose-gemm, moe-ag-scatter, moe-gather-rs" >&2
+        echo "Supported: all, gin-ag, gin-rs, gin-both, ag-gemm, gemm-rs, gemm-a2a-transpose, a2a-transpose-gemm, moe-ag-scatter, moe-gather-rs" >&2
         exit 2
         ;;
 esac
 
 if [ "${BUILD_SCOPE}" != "all" ]; then
-    BUILD_THS="OFF"
     BUILD_TEST="OFF"
+    if [ "${RUNNABLE_BUILD}" = "ON" ]; then
+        BUILD_THS="ON"
+        # Build the configured narrow graph instead of stopping at one object
+        # library: runnable mode needs flux_cuda + flux_cuda_ths_op + install.
+        CMAKE_BUILD_TARGET=""
+    else
+        BUILD_THS="OFF"
+    fi
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -240,9 +265,9 @@ function build_nccl() {
         for arch in "${arch_list[@]}"; do
             NCCL_COMPILE_OPTIONS_ARCH="-gencode=arch=compute_${arch},code=sm_${arch} ${NCCL_COMPILE_OPTIONS_ARCH}"
         done
-        make -j${JOBS} src.staticlib CUDARTLIB=cudart NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=1
+        make -j${JOBS} src.staticlib CUDARTLIB=cudart NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=${MAKE_VERBOSE}
     else
-        make -j${JOBS} src.staticlib CUDARTLIB=cudart VERBOSE=1
+        make -j${JOBS} src.staticlib CUDARTLIB=cudart VERBOSE=${MAKE_VERBOSE}
     fi
     # only install static lib
     mkdir -p ${PREFIX}/lib
@@ -262,6 +287,7 @@ function build_flux_cuda() {
             -DENABLE_GIN_AG=${ENABLE_GIN_AG}
             -DENABLE_GIN_RS=${ENABLE_GIN_RS}
             -DFLUX_BUILD_SCOPE=${BUILD_SCOPE}
+            -DFLUX_BUILD_RUNNABLE=${RUNNABLE_BUILD}
             -DNCCL_ROOT=${NCCL_INSTALL_ROOT}
             -DNCCL_DEVICE_INCLUDE_DIR=${NCCL_SOURCE_ROOT}/src/include
             -DNCCL_PUBLIC_INCLUDE_DIR=${NCCL_INSTALL_ROOT}/include
@@ -295,9 +321,9 @@ function build_flux_cuda() {
     fi
     if [ -n "${CMAKE_BUILD_TARGET}" ]; then
         echo "Minimal Flux build: profile=${BUILD_PROFILE}, target=${CMAKE_BUILD_TARGET}"
-        make -j${JOBS} VERBOSE=1 "${CMAKE_BUILD_TARGET}"
+        make -j${JOBS} VERBOSE=${MAKE_VERBOSE} "${CMAKE_BUILD_TARGET}"
     else
-        make -j${JOBS} VERBOSE=1
+        make -j${JOBS} VERBOSE=${MAKE_VERBOSE}
         make install
     fi
     popd
@@ -332,6 +358,17 @@ function build_flux_py {
     LIBDIR=${PROJECT_ROOT}/python/flux/lib
     mkdir -p ${LIBDIR}
 
+    # setuptools does not know that flux_ths_targets.txt changes the pybind
+    # source list.  When switching AG/RS/full profiles, force only the small
+    # Python extension to relink so a stale extension cannot mask a bad build.
+    PY_PROFILE_KEY="scope=${BUILD_SCOPE};gin_ag=${ENABLE_GIN_AG};gin_rs=${ENABLE_GIN_RS};nvshmem=${ENABLE_NVSHMEM}"
+    PY_PROFILE_STAMP=${PROJECT_ROOT}/build/.flux_python_profile
+    OLD_PY_PROFILE=$(cat "${PY_PROFILE_STAMP}" 2>/dev/null || true)
+    if [ "${OLD_PY_PROFILE}" != "${PY_PROFILE_KEY}" ]; then
+        rm -rf ${PROJECT_ROOT}/build/temp.*
+        rm -f ${PROJECT_ROOT}/python/flux_ths_pybind*.so
+    fi
+
     pushd ${LIBDIR}
     if [ $ENABLE_NVSHMEM == "ON" ]; then
         export FLUX_SHM_USE_NVSHMEM=1
@@ -359,6 +396,7 @@ function build_flux_py {
     if [ $BDIST_WHEEL == "ON" ]; then
         MAX_JOBS=${JOBS} python3 setup.py bdist_wheel
     fi
+    printf '%s\n' "${PY_PROFILE_KEY}" >"${PY_PROFILE_STAMP}"
 }
 
 trap 'rc=$?; if [ "$rc" -eq 0 ]; then merge_compile_commands || true; fi; exit "$rc"' EXIT
@@ -388,9 +426,12 @@ fi
 
 build_protobuf
 build_flux_cuda
-if [ "${BUILD_SCOPE}" = "all" ]; then
+if [ "${BUILD_SCOPE}" = "all" ] || [ "${RUNNABLE_BUILD}" = "ON" ]; then
     build_flux_py
+    if [ "${RUNNABLE_BUILD}" = "ON" ]; then
+        echo "Runnable narrow build complete: profile=${BUILD_PROFILE}, scope=${BUILD_SCOPE}"
+    fi
 else
-    echo "Minimal build complete: ${BUILD_PROFILE} -> ${CMAKE_BUILD_TARGET}"
-    echo "Run with --full when you need install/Python bindings/full regression."
+    echo "Minimal compile-check complete: ${BUILD_PROFILE} -> ${CMAKE_BUILD_TARGET}"
+    echo "Use --runnable to build the selected operator plus Python runtime bindings."
 fi

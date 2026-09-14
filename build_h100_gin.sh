@@ -16,6 +16,8 @@ CLEAN_BUILD=${CLEAN_BUILD:-0}
 CLEAN_NCCL=${CLEAN_NCCL:-0}
 RUN_VERIFY=${RUN_VERIFY:-0}
 RUN_GEMM_TEST=${RUN_GEMM_TEST:-0}
+GIN_MODE=${GIN_MODE:-both}   # ag | rs | both
+PYTHON_BIN=${PYTHON_BIN:-python3}
 
 ########################################
 # CHECK / PYTHON ENV
@@ -38,15 +40,28 @@ if [ -n "${VIRTUAL_ENV:-}" ]; then
 elif [ -d "${VENV_DIR}" ]; then
     source "${VENV_DIR}/bin/activate"
 else
-    echo "ERROR: no active virtualenv and VENV_DIR=${VENV_DIR} does not exist"
-    echo "Run env_prepare_h100.sh first, or export VENV_DIR=/path/to/venv-flux"
+    echo "No virtualenv found; using current Python: $(command -v ${PYTHON_BIN})"
+fi
+
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    echo "ERROR: PYTHON_BIN=${PYTHON_BIN} not found"
     exit 1
 fi
+
+case "${GIN_MODE}" in
+    ag)   GIN_BUILD_ARGS=(--gin-ag) ;;
+    rs)   GIN_BUILD_ARGS=(--gin-rs) ;;
+    both) GIN_BUILD_ARGS=(--gin-ag --gin-rs) ;;
+    *)
+        echo "ERROR: GIN_MODE must be ag, rs, or both; got '${GIN_MODE}'"
+        exit 2
+        ;;
+esac
 
 export CUDA_HOME
 export PATH=${CUDA_HOME}/bin:$PATH
 
-export NVSHMEM_HOME=$(python - <<'PY'
+export NVSHMEM_HOME=$(${PYTHON_BIN} - <<'PY'
 import pathlib
 import nvidia.nvshmem
 print(pathlib.Path(nvidia.nvshmem.__path__[0]))
@@ -55,7 +70,7 @@ PY
 
 echo "NVSHMEM_HOME=${NVSHMEM_HOME}"
 
-TORCH_CUDA_VERSION=$(python - <<'PY'
+TORCH_CUDA_VERSION=$(${PYTHON_BIN} - <<'PY'
 import torch
 print(torch.version.cuda)
 PY
@@ -91,9 +106,15 @@ export FLUX_SHM_USE_NVSHMEM=1
 export LD_LIBRARY_PATH=${NVSHMEM_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}
 
 function write_flux_env_script() {
-cat >"${FLUX_DIR}/flux_env.sh" <<ENVEOF
-source ${VIRTUAL_ENV:-${VENV_DIR}}/bin/activate
+    local activate_line=""
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ -f "${VIRTUAL_ENV}/bin/activate" ]; then
+        activate_line="source ${VIRTUAL_ENV}/bin/activate"
+    elif [ -f "${VENV_DIR}/bin/activate" ]; then
+        activate_line="source ${VENV_DIR}/bin/activate"
+    fi
 
+    cat >"${FLUX_DIR}/flux_env.sh" <<ENVEOF
+${activate_line}
 export CUDA_HOME=${CUDA_HOME}
 export PATH=${CUDA_HOME}/bin:\$PATH
 export NVSHMEM_HOME=${NVSHMEM_HOME}
@@ -105,10 +126,16 @@ export NCCL_PUBLIC_INCLUDE_DIR=${NCCL_INSTALL_ROOT}/include
 export PYTHONPATH=${FLUX_DIR}/python:\${PYTHONPATH:-}
 export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:${NCCL_INSTALL_ROOT}/lib:${CUDA_HOME}/lib64:\${LD_LIBRARY_PATH:-}
 export FLUX_SHM_USE_NVSHMEM=1
-export FLUX_ENABLE_GIN_AG=1
-export FLUX_ENABLE_GIN_RS=1
 ENVEOF
+
+    if [ "${GIN_MODE}" = "ag" ] || [ "${GIN_MODE}" = "both" ]; then
+        echo 'export FLUX_ENABLE_GIN_AG=1' >>"${FLUX_DIR}/flux_env.sh"
+    fi
+    if [ "${GIN_MODE}" = "rs" ] || [ "${GIN_MODE}" = "both" ]; then
+        echo 'export FLUX_ENABLE_GIN_RS=1' >>"${FLUX_DIR}/flux_env.sh"
+    fi
 }
+
 
 ########################################
 # OPTIONAL CLEAN
@@ -128,9 +155,8 @@ fi
 # BUILD
 ########################################
 ./build.sh \
-    --gin-ag \
-    --gin-rs \
-    --full \
+    "${GIN_BUILD_ARGS[@]}" \
+    --runnable \
     --arch 90 \
     --sm-cores 132 \
     --nvshmem \
@@ -149,28 +175,36 @@ if [ "${RUN_VERIFY}" = "1" ] || [ "${RUN_GEMM_TEST}" = "1" ]; then
 fi
 
 if [ "${RUN_VERIFY}" = "1" ]; then
-python - <<'PY'
+GIN_MODE="${GIN_MODE}" ${PYTHON_BIN} - <<'PY'
+import os
 import torch
+import flux
+from flux.cpp_mod import NotCompiled
+
+mode = os.environ["GIN_MODE"]
 print("torch:", torch.__version__)
 print("torch CUDA:", torch.version.cuda)
 print("GPU:", torch.cuda.get_device_name(0))
 print("SM count:", torch.cuda.get_device_properties(0).multi_processor_count)
-import flux
+if mode in ("ag", "both"):
+    assert not isinstance(flux.GinAGKernel, NotCompiled), "GinAGKernel was not compiled"
+    print("GinAGKernel: compiled")
+if mode in ("rs", "both"):
+    assert not isinstance(flux.GemmRS, NotCompiled), "GemmRS was not compiled"
+    print("GemmRS (GIN RS enabled build): compiled")
 print("flux import ok")
 PY
 fi
 
 if [ "${RUN_GEMM_TEST}" = "1" ]; then
-    python test/python/gemm_only/test_gemm_only.py \
-        4096 12288 6144 \
-        --input_dtype bfloat16 \
-        --weight_dtype bfloat16 \
-        --iters 5
+    echo "ERROR: RUN_GEMM_TEST belongs to the full/comm_none build and is intentionally excluded from the narrow runnable GIN build."
+    echo "Use RUN_VERIFY=1 here; run test_gin_* on a supported multi-node setup."
+    exit 2
 fi
 
 echo ""
 echo "===================================="
-echo "FLUX GIN BUILD SUCCESS"
+echo "FLUX GIN BUILD SUCCESS (mode=${GIN_MODE}, narrow runnable profile)"
 echo "runtime env: source ${FLUX_DIR}/flux_env.sh"
 echo "NCCL_SOURCE_ROOT=${NCCL_SOURCE_ROOT}"
 echo "incremental build: CLEAN_BUILD=0 CLEAN_NCCL=0"

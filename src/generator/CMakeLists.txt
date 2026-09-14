@@ -9,8 +9,25 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 find_package(CUDAToolkit REQUIRED)
 
 set(FLUX_PROJECT_DIR ${PROJECT_SOURCE_DIR}/../../)
-set(FLUX_CCCL_INCLUDE "${CUDAToolkit_INCLUDE_DIRS}/cccl")
-if(EXISTS "${FLUX_CCCL_INCLUDE}/cuda/std/utility")
+set(_FLUX_CCCL_HINTS "")
+foreach(_cuda_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
+  list(APPEND _FLUX_CCCL_HINTS "${_cuda_inc}/cccl")
+endforeach()
+if(DEFINED CUDAToolkit_TARGET_DIR)
+  list(APPEND _FLUX_CCCL_HINTS "${CUDAToolkit_TARGET_DIR}/include/cccl")
+endif()
+if(DEFINED CMAKE_CXX_COMPILER)
+  # The generator is a host-C++ project, so CMAKE_CUDA_COMPILER_TOOLKIT_ROOT
+  # may not be available. CUDA_HOME is the most reliable extra hint here.
+  if(DEFINED ENV{CUDA_HOME})
+    list(APPEND _FLUX_CCCL_HINTS "$ENV{CUDA_HOME}/include/cccl")
+  endif()
+endif()
+unset(FLUX_CCCL_INCLUDE CACHE)
+find_path(FLUX_CCCL_INCLUDE
+  NAMES cuda/std/utility
+  HINTS ${_FLUX_CCCL_HINTS})
+if(FLUX_CCCL_INCLUDE)
   message(STATUS "Generator: using CCCL include ${FLUX_CCCL_INCLUDE}")
 else()
   set(FLUX_CCCL_INCLUDE "")

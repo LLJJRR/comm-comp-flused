@@ -43,28 +43,30 @@ execute_process(
   COMMAND_ERROR_IS_FATAL ANY
 )
 
-set(_FLUX_GENERATOR_TARGET "")
+set(_FLUX_GENERATOR_TARGETS "")
 if(FLUX_BUILD_SCOPE STREQUAL "comm_none")
-  set(_FLUX_GENERATOR_TARGET gen_comm_none)
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_comm_none)
 elseif(FLUX_BUILD_SCOPE STREQUAL "ag_gemm")
-  set(_FLUX_GENERATOR_TARGET gen_ag_gemm)
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_ag_gemm)
 elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_rs")
-  set(_FLUX_GENERATOR_TARGET gen_gemm_rs)
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_gemm_rs)
+elseif(FLUX_BUILD_SCOPE STREQUAL "gin_fusions")
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_ag_gemm gen_gemm_rs)
 elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_a2a_transpose")
-  set(_FLUX_GENERATOR_TARGET gen_gemm_a2a_transpose)
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_gemm_a2a_transpose)
 elseif(FLUX_BUILD_SCOPE STREQUAL "a2a_transpose_gemm")
-  set(_FLUX_GENERATOR_TARGET gen_a2a_transpose_gemm)
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_a2a_transpose_gemm)
 elseif(FLUX_BUILD_SCOPE STREQUAL "moe_ag_scatter")
-  set(_FLUX_GENERATOR_TARGET gen_moe_ag_scatter)
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_moe_ag_scatter)
 elseif(FLUX_BUILD_SCOPE STREQUAL "moe_gather_rs")
-  set(_FLUX_GENERATOR_TARGET gen_moe_gather_rs)
+  list(APPEND _FLUX_GENERATOR_TARGETS gen_moe_gather_rs)
 elseif(NOT FLUX_BUILD_SCOPE STREQUAL "all")
   message(FATAL_ERROR "Unknown FLUX_BUILD_SCOPE='${FLUX_BUILD_SCOPE}'")
 endif()
 
-if(_FLUX_GENERATOR_TARGET)
+if(_FLUX_GENERATOR_TARGETS)
   execute_process(
-    COMMAND ${CMAKE_COMMAND} --build . --parallel 8 --target ${_FLUX_GENERATOR_TARGET}
+    COMMAND ${CMAKE_COMMAND} --build . --parallel 8 --target ${_FLUX_GENERATOR_TARGETS}
     WORKING_DIRECTORY ${FLUX_GENERATOR_BINARY_DIR}
     COMMAND_ERROR_IS_FATAL ANY
   )
@@ -117,8 +119,24 @@ if(FLUX_BUILD_SCOPE STREQUAL "all")
 elseif(FLUX_BUILD_SCOPE STREQUAL "comm_none")
   add_subdirectory(comm_none)
 elseif(FLUX_BUILD_SCOPE STREQUAL "ag_gemm")
+  # Runnable AG needs the small coll support target because the regular
+  # AGKernel THS implementation owns an AllGatherOp. Compile-check mode does
+  # not link THS and can stay at the single AG object library.
+  if(FLUX_BUILD_RUNNABLE)
+    add_subdirectory(coll)
+  endif()
   add_subdirectory(ag_gemm)
 elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_rs")
+  if(FLUX_BUILD_RUNNABLE)
+    add_subdirectory(coll)
+  endif()
+  add_subdirectory(gemm_rs)
+elseif(FLUX_BUILD_SCOPE STREQUAL "gin_fusions")
+  if(NOT ENABLE_GIN_AG OR NOT ENABLE_GIN_RS)
+    message(FATAL_ERROR "gin_fusions scope requires ENABLE_GIN_AG=ON and ENABLE_GIN_RS=ON")
+  endif()
+  add_subdirectory(coll)
+  add_subdirectory(ag_gemm)
   add_subdirectory(gemm_rs)
 elseif(FLUX_BUILD_SCOPE STREQUAL "gemm_a2a_transpose")
   add_subdirectory(gemm_a2a_transpose)
@@ -136,10 +154,12 @@ elseif(FLUX_BUILD_SCOPE STREQUAL "moe_gather_rs")
   add_subdirectory(moe_gather_rs)
 endif()
 message(STATUS "FLUX_BUILD_SCOPE=${FLUX_BUILD_SCOPE}")
+message(STATUS "FLUX_BUILD_RUNNABLE=${FLUX_BUILD_RUNNABLE}")
 message(STATUS "op_targets: ${FLUX_CUDA_OP_TARGETS}")
 
-if(FLUX_BUILD_SCOPE STREQUAL "all")
-  # this must be after all op subdirectory added
+if(FLUX_BUILD_SCOPE STREQUAL "all" OR FLUX_BUILD_RUNNABLE)
+  # This must be after the selected op subdirectories so the aggregate core
+  # and THS libraries link exactly the requested operator family.
   add_subdirectory(cuda)
 
   if (BUILD_THS)
